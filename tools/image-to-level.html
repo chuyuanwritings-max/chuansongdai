@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>给一张图就出一关</title>
+<style>
+  body { font-family: "PingFang SC", sans-serif; background: #1a1217; color: #eee; margin: 0; padding: 20px; }
+  h1 { font-size: 20px; color: #f5d58c; }
+  .row { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
+  .drop { border: 2px dashed #8a5f26; border-radius: 12px; padding: 30px; width: 260px; text-align: center; cursor: pointer; }
+  canvas { image-rendering: pixelated; border: 2px solid #8a5f26; border-radius: 6px; background: #1f3456; }
+  textarea { width: 360px; height: 330px; background: #120d14; color: #f5d58c; font-family: monospace; font-size: 14px; border: 1px solid #8a5f26; border-radius: 6px; }
+  label { display: block; margin: 8px 0; font-size: 14px; }
+  .tip { color: #a99; font-size: 13px; line-height: 1.6; max-width: 640px; }
+  #report { white-space: pre; font-size: 13px; color: #9fe3e0; }
+</style>
+</head>
+<body>
+<h1>给一张图就出一关</h1>
+<p class="tip">拖一张图片进来（攻城机关的零件、图纸都行）。它会缩成小格子，颜色归到游戏里 8 种连弩颜色，右边吐出一段字母图：复制、贴进 <code>js/levels.js</code> 的 LEVELS 里就是一关。下面会用机器人试打 40 遍，告诉你难不难。<br>
+出图规矩（机器人量出来的）：① <b>整张要填满</b>——空白会自动填成一种「图纸底色」（fill），里层颜色被外层挡住，才要想先放哪台；留空的图闭眼乱点也能赢。② <b>一大块主色、里面嵌几处小细节</b>的图，输都输在最后一点；<b>一圈套一圈超过两层</b>的图会让人死在中盘。③ 颜色 3–5 种（不算底色）。</p>
+<div class="row">
+  <div>
+    <div class="drop" id="drop">点这里选图片，或者把图片拖进来</div>
+    <input type="file" id="file" accept="image/*" style="display:none">
+    <label>格子数 <input type="number" id="size" value="16" min="8" max="24"></label>
+    <label>最多几种颜色 <input type="number" id="ncol" value="4" min="2" max="6"></label>
+    <label>当作空白的背景：<input type="checkbox" id="bg" checked> 四个角的颜色算背景</label>
+  </div>
+  <canvas id="preview" width="320" height="320"></canvas>
+  <textarea id="out" spellcheck="false"></textarea>
+</div>
+<div id="report"></div>
+<script>
+// 8 种连弩颜色（和 js/main.js 一样）
+const PAL = { R: '#e5484d', O: '#f2994a', Y: '#f5cf4c', G: '#56c271', T: '#3fc1c9', B: '#4a7cf0', P: '#9b6bdc', K: '#f27fb2' };
+const KEYS = Object.keys(PAL);
+const hex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
+const PRGB = KEYS.map((k) => hex(PAL[k]));
+let img = null;
+const $ = (id) => document.getElementById(id);
+$('drop').onclick = () => $('file').click();
+$('file').onchange = (e) => load(e.target.files[0]);
+document.body.ondragover = (e) => e.preventDefault();
+document.body.ondrop = (e) => { e.preventDefault(); load(e.dataTransfer.files[0]); };
+['size', 'ncol', 'bg'].forEach((id) => ($(id).oninput = run));
+
+function load(f) {
+  if (!f) return;
+  const im = new Image();
+  im.onload = () => { img = im; run(); };
+  im.src = URL.createObjectURL(f);
+}
+
+function dist(a, b) { return (a[0] - b[0]) ** 2 * 0.3 + (a[1] - b[1]) ** 2 * 0.59 + (a[2] - b[2]) ** 2 * 0.11; }
+
+function run() {
+  if (!img) return;
+  const N = +$('size').value;
+  const c = document.createElement('canvas');
+  c.width = c.height = N;
+  const x = c.getContext('2d');
+  const s = Math.min(img.width, img.height);
+  x.drawImage(img, (img.width - s) / 2, (img.height - s) / 2, s, s, 0, 0, N, N);
+  const d = x.getImageData(0, 0, N, N).data;
+  const px = [];
+  for (let i = 0; i < N * N; i++) px.push([d[i * 4], d[i * 4 + 1], d[i * 4 + 2], d[i * 4 + 3]]);
+  // 背景：四个角的平均色，接近它的算空
+  const corners = [0, N - 1, N * (N - 1), N * N - 1].map((i) => px[i]);
+  const bgc = [0, 1, 2].map((k) => corners.reduce((a, p) => a + p[k], 0) / 4);
+  const isBg = (p) => p[3] < 100 || ($('bg').checked && dist(p, bgc) < 900);
+  // 每格先归到最近的连弩色，再只留出现最多的几种
+  const near = px.map((p) => { if (isBg(p)) return -1; let b = 0, bv = 1e9; PRGB.forEach((q, k) => { const v = dist(p, q); if (v < bv) { bv = v; b = k; } }); return b; });
+  const cnt = KEYS.map((_, k) => near.filter((v) => v === k).length);
+  const keep = KEYS.map((_, k) => k).sort((a, b) => cnt[b] - cnt[a]).slice(0, +$('ncol').value).filter((k) => cnt[k] > 0);
+  const final = near.map((v, i) => { if (v < 0) return -1; if (keep.includes(v)) return v; let b = keep[0], bv = 1e9; keep.forEach((k) => { const q = dist(px[i], PRGB[k]); if (q < bv) { bv = q; b = k; } }); return b; });
+  const rows = [];
+  for (let y = 0; y < N; y++) { let r = ''; for (let xx = 0; xx < N; xx++) { const v = final[y * N + xx]; r += v < 0 ? '.' : KEYS[v]; } rows.push(r); }
+  const used = new Set(rows.join(''));
+  const fillc = ['T', 'B', 'K', 'G', 'P', 'R', 'O', 'Y'].find((c) => !used.has(c));
+  window.__fill = fillc;
+  $('out').value = "  {\n    name: '新关卡',\n    cols: 4,\n    slots: 3,\n    bury: 0,\n    tail: -2,\n    fill: '" + fillc + "',\n    chunks: [20, 30, 40],\n    art: [\n" + rows.map((r) => "      '" + r + "',").join('\n') + '\n    ],\n  },';
+  const pv = $('preview').getContext('2d');
+  const cs = 320 / N;
+  pv.clearRect(0, 0, 320, 320);
+  rows.forEach((r, y) => [...r].forEach((ch, xx) => { if (ch !== '.') { pv.fillStyle = PAL[ch]; pv.fillRect(xx * cs, y * cs, cs, cs); } }));
+  test(rows);
+}
+
+// 用游戏里同一份规则（core.js）让机器人试打
+let core = null;
+async function getCore() {
+  if (core) return core;
+  const html = await (await fetch('../preview.html')).text();
+  const m = html.match(/__def\("js\/core\.js", function \(module, exports, require\) \{\n([\s\S]*?)\n\}\);\n__def/);
+  const mod = { exports: {} };
+  new Function('module', 'exports', m[1])(mod, mod.exports);
+  core = mod.exports;
+  return core;
+}
+async function test(rows) {
+  try {
+    const c = await getCore();
+    const def = { art: rows, cols: 4, slots: 3, bury: 0, tail: -2, fill: window.__fill, chunks: [20, 30, 40] };
+    let win = 0, t = 0, near = 0, lose = 0, rnd = 0;
+    for (let k = 0; k < 40; k++) {
+      const lvl = c.buildLevel(def, 100 + k);
+      if (c.simulateRandom(lvl, k + 3).win) rnd++;
+      const r = c.simulate(lvl, k + 1, { react: 0.6, noise: 0.3 });
+      t += r.time;
+      if (r.win) win++; else { lose++; if (r.left / r.total <= 0.25) near++; }
+    }
+    $('report').textContent = `机器人试打 40 遍（3 格槽、4 列）：像真人的机器人赢 ${Math.round(win / 0.4)}%、闭眼乱点赢 ${Math.round(rnd / 0.4)}%（两个差得越多越好），一局 ${Math.round(t / 40)} 秒，输的局里差一点（剩 ≤25%）${lose ? Math.round((100 * near) / lose) : '-'}%\n真人赢太多 → 槽少一格；赢太少 → 槽多一格、或者少一种颜色。乱点也赢得多 → 图太空或颜色都露在外面，换图。`;
+  } catch (e) {
+    $('report').textContent = '（试打要用本地服务器打开这个页面才行：在原型文件夹里运行 npx serve，再打开 /tools/image-to-level.html。字母图照样能用。）';
+  }
+}
+</script>
+</body>
+</html>
