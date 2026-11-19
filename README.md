@@ -2,7 +2,7 @@
 
 2026-11-19 · Kira 搭 · 底子《沙画消消》/ Pixel Flow，改三成：清完露出连载插画、同色三台合体、墨家蒸汽朋克换皮。点子卡：`../点子卡_1.1.md`（Cc 已批）。
 
-手机试玩：（推送后填）
+手机试玩：https://chuyuanwritings-max.github.io/chuansongdai/
 
 ## 怎么打开
 
