@@ -43,7 +43,12 @@ __def("js/core.js", function (module, exports, require) {
 // 玩法核心：只有格子、连弩、传送带、槽位，不画图。
 // 手机里、浏览器里、node 机器人里跑的都是这一份。画面层只读 g 和 g.events。
 //
-// C 版（玩具版）和原型的区别就在这几条规则：
+// 2026-11-20 C 版改成「Pixel Flow 照做版」（拆解见 传送带消除/拆解_PixelFlow_前10关_20261120.md）：
+//   - 连弩每经过一列 / 一行只打一发：打这条线最外面那格，同色才打（原作就是这样）
+//   - 等待槽 5 格、传送带同时 5 台，前 20 关都不变；传送带一圈 6 秒（按图大小算速度）
+//   - 弹药只有 10/20/30/40：出关时把每种颜色的格子数修成整十（只动边上几格），每色弹药加起来 = 格子数
+//   - 不合体、一关一张图（玩具版的热身图、合体先关掉，等照做版好玩了再当「改」的一步加回来）
+// 下面是玩具版留下的说明（规则已按上面改）：
 //   - 连弩经过一列 / 一行，把这条线上从外往里「连着的同色」一口气全吃掉（原型：一发）
 //   - 合体大连弩会穿透：这条线上所有同色都吃，挡在中间的别的颜色不管
 //   - 传送带同时 5 台、速度 18 格/秒（16×16 的图绕一圈 4.2 秒）
@@ -51,14 +56,16 @@ __def("js/core.js", function (module, exports, require) {
 //     每张图的连弩子弹加起来正好等于格子数，所以一张图清完时传送带、机关匣、下面几列都刚好空了
 
 const CFG = {
+  lapSec: 6, // 照做版：传送带一圈几秒（原作约 6 秒）。速度 = 一圈格数 / lapSec
+  perLane: 1, // 照做版：每条线打几发（原作 1 发）
   speed: 18, // 传送带速度：格 / 秒（16×16 的图一圈 76 格，绕一圈约 4.2 秒）
   corner: 3, // 拐角算几格长
   pierce: true, // 合体大连弩：穿透别的颜色，这条线上的同色全吃
-  beltCap: 5, // 传送带上最多几台（玩具版放宽：点一下马上就上去）
-  gap: 3, // 两台连弩在传送带上至少隔几格
+  beltCap: 5, // 传送带上最多几台（原作 5 台）
+  gap: 2, // 两台连弩在传送带上至少隔几格
   stagePause: 0.8, // 一张图清完到下一张掉下来，停多久（秒，给「叮」的特效留时间）
-  merge: true, // 槽里同色三台合体
-  rescue: true, // 槽满时刚好凑成三台也算救回来
+  merge: false, // 槽里同色三台合体（照做版关掉）
+  rescue: false, // 槽满时刚好凑成三台也算救回来
 };
 
 // 颜色：字母 → 序号。关卡图里用字母画。
@@ -228,6 +235,7 @@ function createGame(level, opts) {
     w: level.w,
     h: level.h,
     L: loopLen(level.w, level.h),
+    speed: CFG.lapSec ? loopLen(level.w, level.h) / CFG.lapSec : CFG.speed,
     stages,
     stage: 0,
     stageLeft: 0,
@@ -387,7 +395,7 @@ function step(g, dt) {
   }
   for (let i = 0; i < g.belt.length; i++) {
     const s = g.belt[i];
-    s.s += CFG.speed * dt;
+    s.s += g.speed * dt;
     if (s.s >= g.L) {
       if (g.dog && s.big && !s.extra) {
         s.s -= g.L;
@@ -409,7 +417,7 @@ function step(g, dt) {
       s.laneDone = false;
     }
     if (s.laneDone) continue; // 这条线吃过了
-    const run = laneRun(g.cells, g.w, g.h, ln.dir, ln.k, s.color, s.ammo, CFG.pierce && s.big > 0);
+    const run = laneRun(g.cells, g.w, g.h, ln.dir, ln.k, s.color, Math.min(s.ammo, CFG.perLane || s.ammo), CFG.pierce && s.big > 0);
     if (!run.length) continue; // 最外面不是同色：还在这条线上就接着等（别的连弩可能马上把外层剥掉）
     // 一口气吃掉这一串：规则上同一帧就清掉，画面按 k 一格格错开飞子弹（哒哒哒）
     s.laneDone = true;
@@ -460,7 +468,7 @@ function estimate(g, s, scratch) {
   ];
   for (const [dir, n, kf] of lanes) {
     for (let j = 0; j < n && ammo > 0; j++) {
-      const run = laneRun(c, g.w, g.h, dir, kf(j), s.color, ammo, pierce);
+      const run = laneRun(c, g.w, g.h, dir, kf(j), s.color, Math.min(ammo, CFG.perLane || ammo), pierce);
       for (const idx of run) c[idx] = -1;
       ammo -= run.length;
       hits += run.length;
@@ -551,6 +559,104 @@ function simulateRandom(level, seed, opt) {
   return { win: g.status === 'win', time: g.time, left: g.left, total: g.total };
 }
 
+// —— 照做版：把每种颜色的格子数修成整十（弹药只出 10/20/30/40，一眼能算） ——
+// 只动颜色交界处几格：零头 ≤5 就把这几格让给旁边（空白或邻色），>5 就从旁边借几格补齐。
+// 从少到多一个个修，最多的颜色（多半是底色）最后修；没有空白的图总格数是整十，最后一色自动整十。
+function round10(cells, w, h) {
+  const nb = (i) => {
+    const x = i % w, y = (i / w) | 0, o = [];
+    if (x > 0) o.push(i - 1);
+    if (x < w - 1) o.push(i + 1);
+    if (y > 0) o.push(i - w);
+    if (y < h - 1) o.push(i + w);
+    return o;
+  };
+  const count = () => {
+    const n = new Array(ORDER.length).fill(0);
+    for (let i = 0; i < cells.length; i++) if (cells[i] >= 0) n[cells[i]]++;
+    return n;
+  };
+  // 铺满的图总格数不是整十（16×16=256、18×18=324）：先从四个角往里挖掉零头那几格
+  let total = 0;
+  for (let i = 0; i < cells.length; i++) if (cells[i] >= 0) total++;
+  // 原图有空白：零头可以让给空白；铺满的图只在颜色之间挪，总数保持整十
+  const useEmpty = total < cells.length;
+  const cut = total % 10;
+  if (cut) {
+    const corners = [[0, 0, 1, 0], [w - 1, 0, -1, 0], [0, h - 1, 1, 0], [w - 1, h - 1, -1, 0]];
+    let done = 0;
+    for (let step = 0; done < cut && step < w; step++)
+      for (const [x0, y0, dx] of corners) {
+        if (done >= cut) break;
+        const i = y0 * w + x0 + dx * step;
+        if (cells[i] >= 0) { cells[i] = -1; done++; }
+      }
+  }
+  for (let pass = 0; pass < 6; pass++) {
+    const n0 = count();
+    // 修的顺序：从最多的颜色（根）出发按「挨着」往外找，离根最远的先修，每色总有一个挨着它、后修的颜色可以交换
+    const present = n0.map((v, c) => c).filter((c) => n0[c] > 0);
+    const adj = {};
+    present.forEach((c) => (adj[c] = new Set()));
+    for (let i = 0; i < cells.length; i++) {
+      if (cells[i] < 0) continue;
+      for (const j of nb(i)) if (cells[j] >= 0 && cells[j] !== cells[i]) adj[cells[i]].add(cells[j]);
+    }
+    const root = present.slice().sort((a, b) => n0[b] - n0[a])[0];
+    const seen = [root];
+    for (let q = 0; q < seen.length; q++) for (const v of [...adj[seen[q]]].sort((a, b) => n0[b] - n0[a])) if (!seen.includes(v)) seen.push(v);
+    present.forEach((c) => !seen.includes(c) && seen.push(c));
+    const colors = seen.slice().reverse();
+    // 只和排在后面（更多）的颜色、或空白交换，修好的颜色不会再被碰乱
+    const rank = {};
+    colors.forEach((c, k) => (rank[c] = k));
+    const later = (c, v) => (v < 0 ? useEmpty : rank[v] > rank[c]);
+    let changed = false;
+    for (const c of colors) {
+      const n = count();
+      const r = n[c] % 10;
+      if (!r) continue;
+      changed = true;
+      // 邻居里谁最多（空白算 -1，优先给空白）
+      const pickTo = (i) => {
+        const vs = nb(i).map((j) => cells[j]).filter((v) => v !== c && later(c, v));
+        if (!vs.length) return null;
+        if (vs.includes(-1) && useEmpty) return -1;
+        const cs = vs.filter((v) => v >= 0);
+        if (!cs.length) return null;
+        return cs.sort((a, b) => n[b] - n[a])[0];
+      };
+      if (r <= 5) {
+        // 去掉 r 格：挑同色邻居最少的（突出的那几格），让给旁边
+        const cand = [];
+        for (let i = 0; i < cells.length; i++) if (cells[i] === c) {
+          const to = pickTo(i);
+          if (to === null) continue;
+          const same = nb(i).filter((j) => cells[j] === c).length;
+          cand.push({ i, to, k: same * 10 + (to === -1 ? 0 : 5) + ((i * 7) % 5) * 0.1 });
+        }
+        cand.sort((a, b) => a.k - b.k);
+        for (let t = 0; t < r && t < cand.length; t++) cells[cand[t].i] = cand[t].to;
+      } else {
+        // 补 10-r 格：挑紧挨着这色、同色邻居最多的格（填凹口），优先空白，其次最多的那色
+        const need = 10 - r;
+        const cand = [];
+        for (let i = 0; i < cells.length; i++) {
+          const v = cells[i];
+          if (v === c || !later(c, v)) continue;
+          const same = nb(i).filter((j) => cells[j] === c).length;
+          if (!same) continue;
+          cand.push({ i, k: -same * 10 + (v === -1 ? 0 : 3) - (v >= 0 ? n[v] / 1000 : 0) + ((i * 7) % 5) * 0.1 });
+        }
+        cand.sort((a, b) => a.k - b.k);
+        for (let t = 0; t < need && t < cand.length; t++) cells[cand[t].i] = c;
+      }
+    }
+    if (!changed) break;
+  }
+  return cells;
+}
+
 // —— 给图出关 ——
 // def: { art: [...字符串], warm: { name, art }（可选：先来的那件小东西）, cols: 列数, slots: 槽数, chunks: [每台子弹数可选值] }
 // 每张图：数每种颜色多少格 → 拆成一台台连弩 → 洗牌发进几列 → 机器人试打一遍，保证有解
@@ -558,6 +664,7 @@ function buildStage(art0, def, seed) {
   // fill：把空白填成一种底色（原型用来「整张填满」加难度；玩具版的图都不填，留空才看得出形状）
   const art = def.fill ? art0.map((r) => r.replace(/\./g, def.fill)) : art0;
   const img = parseArt(art, def.scale || 1);
+  if (def.round10) round10(img.cells, img.w, img.h);
   const r = rng(seed);
   const counts = new Array(ORDER.length).fill(0);
   const depthSum = new Array(ORDER.length).fill(0);
@@ -640,6 +747,7 @@ module.exports = {
   simulate,
   simulateRandom,
   buildLevel,
+  round10,
 };
 
 });
@@ -1231,7 +1339,8 @@ __def("js/levels.js", function (module, exports, require) {
 //   - 一关两张图：warm 是先来的一件小东西（热身，清完「叮」一下），art 是主图（清完插画刷开）
 //   - 前 3 关几乎输不了（5 格槽、子弹给得足）；后面稍紧，输也输在最后一点
 
-const LEVELS = [
+// 下面是玩具版的 8 关（16 张图）。照做版只借它们的图，关卡数字照 Pixel Flow 前 20 关重排（见文件末尾）
+const OLD = [
   {
     name: '铜雀',
     warm: { name: '齿轮', art: [
@@ -1575,14 +1684,80 @@ const LEVELS = [
   },
 ];
 
-// 第 n 关（从 0 数）。8 关以后循环，槽少一格（最少 4 格）
-function levelDef(n) {
-  const base = LEVELS[n % LEVELS.length];
-  if (n < LEVELS.length) return base;
-  return Object.assign({}, base, { slots: Math.max(4, base.slots - 1) });
+// —— 照做版（2026-11-20）：照 Pixel Flow 前 20 关的数字排 ——
+// 拆解：传送带消除/拆解_PixelFlow_前10关_20261120.md
+// 原作规矩：槽 5、传送带 5 台从不变；难度只靠颜色数和列数；约每 4 关一个难关，难关后跟轻松关；
+// 第 8 关上「问号炮台」（只露每列最前面那台）。图是我们自己的（汐娘工坊里的东西）。
+const ART = {};
+OLD.forEach((d) => {
+  ART[d.name] = d.art;
+  if (d.warm) ART[d.warm.name] = d.warm.art;
+});
+
+// 给 16×16 的图加底色和几圈边框：空白填底色，外面一圈圈套边框色（原作的图多半是铺满的方块画）
+function pad(art, bg, rings) {
+  const n = rings.length;
+  const w = art[0].length + 2 * n;
+  const rows = [];
+  for (let y = 0; y < art.length + 2 * n; y++) {
+    let r = '';
+    for (let x = 0; x < w; x++) {
+      const d = Math.min(x, y, w - 1 - x, art.length + 2 * n - 1 - y);
+      if (d < n) r += rings[d];
+      else {
+        const ch = art[y - n][x - n];
+        r += ch === '.' ? bg : ch;
+      }
+    }
+    rows.push(r);
+  }
+  return rows;
+}
+// 换色：{ N: 'O' } = 把棕色那块画成铜色（用来减颜色数）
+function recolor(art, map) {
+  return art.map((r) => r.replace(/./g, (ch) => (map[ch] !== undefined ? map[ch] : ch)));
 }
 
-module.exports = { LEVELS, levelDef };
+// 每关：name 名字、art 图、cols 列数、chunks 弹药可选值、bury（负 = 外层颜色先来，越负越顺手）、
+// mystery 问号炮台、hard 难关标记、tip 第 1 关教学字
+const BASE = { slots: 5, round10: true, head: 1, tail: 0 };
+const LEVELS = [
+  { name: '齿轮', art: ART['齿轮'], cols: 2, chunks: [40, 30, 20], bury: -2, tip: true },
+  { name: '骨头', art: ART['骨头'], cols: 3, chunks: [40, 30, 20], bury: -2 },
+  { name: '蜡烛', art: ART['蜡烛'], cols: 2, chunks: [30, 20, 10], bury: -1.5 },
+  { name: '锤子', art: ART['锤子'], cols: 3, chunks: [40, 30, 20], bury: -1.5 },
+  { name: '水银瓶', art: ART['水银瓶'], cols: 3, chunks: [30, 40], bury: -1.5 },
+  { name: '蝴蝶结', art: ART['蝴蝶结'], cols: 3, chunks: [30, 40], bury: -1.5 },
+  { name: '菜叶', art: pad(recolor(ART['菜叶'], { N: 'G' }), 'B', []), cols: 3, chunks: [20, 40], bury: -1 },
+  { name: '蒸汽龟', art: pad(recolor(ART['蒸汽龟'], { D: 'G' }), 'T', []), cols: 2, chunks: [10, 20], bury: -1, mystery: true, intro: 'mystery' },
+  { name: '木犬', art: pad(ART['木犬'], 'G', ['R']), cols: 3, chunks: [20, 30, 20], bury: -0.8, mystery: true },
+  { name: '灯笼', art: pad(ART['灯笼'], 'B', ['T']), cols: 3, chunks: [10, 20], bury: -0.8, mystery: true },
+  { name: '工具箱', art: pad(ART['工具箱'], 'P', ['K']), cols: 4, chunks: [10, 20, 30], bury: -0.3, mystery: true, mid: true },
+  { name: '铜雀', art: ART['铜雀'], cols: 3, chunks: [20, 30, 40], bury: -1.5 },
+  { name: '茶壶', art: recolor(ART['蒸汽茶壶'], { N: 'O' }), cols: 3, chunks: [10, 20, 30, 40], bury: -1.5 },
+  { name: '护目镜', art: pad(ART['护目镜'], 'P', ['R', 'K']), cols: 2, chunks: [10, 20], bury: -0.5, mystery: true, mid: true },
+  { name: '茶杯', art: pad(ART['茶杯'], 'B', ['G']), cols: 3, chunks: [20, 40], bury: -0.5, mid: true },
+  { name: '汐娘', art: pad(ART['汐娘'], 'K', ['P']), cols: 4, chunks: [10, 20], hard: true, tune: { head: 0.55, bury: 0.2 } },
+  { name: '蒸汽龟·二', art: ART['蒸汽龟'], cols: 3, chunks: [20], bury: -1.5 },
+  { name: '骨头·二', art: pad(ART['骨头'], 'Y', []), cols: 3, chunks: [20, 30, 40], bury: -1.5 },
+  { name: '工具箱·二', art: pad(ART['工具箱'], 'G', ['B', 'K']), cols: 3, chunks: [10, 20, 30, 40], bury: 0.3, mystery: true, hard: true },
+  { name: '汐娘·二', art: pad(ART['汐娘'], 'O', ['R', 'G', 'B']), cols: 4, chunks: [20, 40], hard: true, tune: { head: 0.6, bury: 0.15 } },
+].map((d) => {
+  const o = Object.assign({}, BASE, d);
+  // 难关、中等关：只有开头一小段按「外层先」排，其余照出关规则把里层颜色往前放
+  if (d.hard) Object.assign(o, { head: 0.3, bury: 0.7 });
+  else if (d.mid) Object.assign(o, { head: 0.5, bury: 0.3 });
+  if (d.tune) Object.assign(o, d.tune); // 单关微调（机器人量过）
+  return o;
+});
+
+// 第 n 关（从 0 数）。20 关以后从第 9 关起循环（不缩槽：原作难度不靠缩槽）
+function levelDef(n) {
+  if (n < LEVELS.length) return LEVELS[n];
+  return LEVELS[8 + ((n - LEVELS.length) % (LEVELS.length - 8))];
+}
+
+module.exports = { LEVELS, levelDef, OLD, ART, pad };
 
 });
 __def("js/main.js", function (module, exports, require) {
@@ -1614,7 +1789,7 @@ const BRASS_D = '#8a5f26';
 const BRASS_L = '#f5d58c';
 const FONT = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif';
 const STEP = 1 / 60;
-const SAVE_KEY = 'cjg_save_v1';
+const SAVE_KEY = 'cjg_pf_v1';
 const BUY_COST = 30;
 const MAX_ADS = 3;
 
@@ -1630,7 +1805,7 @@ const W = scr.width;
 const H = scr.height;
 const DPR = scr.dpr;
 
-const save = Object.assign({ level: 0, coins: 0, album: [], pets: {}, buy: false, plays: 0, hinted: false, newAlbum: false }, P.load(SAVE_KEY) || {});
+const save = Object.assign({ level: 0, coins: 0, album: [], pets: {}, buy: false, plays: 0, hinted: false, newAlbum: false, seen: {} }, P.load(SAVE_KEY) || {});
 function persist() {
   P.save(SAVE_KEY, save);
 }
@@ -1782,6 +1957,12 @@ function startLevel() {
   if (S.stats.lastEnd !== null) S.stats.restarts.push(S.time - S.stats.lastEnd);
   S.stats.lastEnd = null;
   S.roundStart = S.time;
+  S.tip2 = 0;
+  // 照做版：新机制那关先弹一张卡片（原作第 8 关：问号炮台）；难关开局提示一下
+  S.card = null;
+  S.toast = null;
+  if (S.def.intro && !save.seen[S.def.intro]) S.card = { kind: S.def.intro, t: 0 };
+  else if (S.def.hard) S.toast = { text: '难关！', t: 1.4 };
 }
 
 // 盖在插画上的一层：蓝图纸 + 敌方机关的像素。射掉一格就在这层上挖一个洞，底下的插画露出来
@@ -1877,6 +2058,7 @@ function onEvent(e) {
       if (!save.hinted) {
         save.hinted = true;
         persist();
+        if (S.levelNo === 0) S.tip2 = 3.5; // 第二句教学字：等它转一圈
       }
       break;
     }
@@ -2024,6 +2206,7 @@ function update(dt) {
     S.toast.t -= dt;
     if (S.toast.t <= 0) S.toast = null;
   }
+  if (S.tip2 > 0) S.tip2 -= dt;
   if (S.ad) {
     S.ad.t -= dt;
     if (S.ad.t <= 0) {
@@ -2083,7 +2266,7 @@ function update(dt) {
     if (sh.flyT !== undefined) sh.flyT += dt;
     if (sh.popT !== undefined) sh.popT += dt;
   }
-  if (S.album.open) return;
+  if (S.album.open || S.card) return;
   if (S.hitstop > 0) {
     S.hitstop -= dt;
   } else if (g.status === 'play') {
@@ -2258,8 +2441,9 @@ function coinIcon(x, y, r) {
 }
 
 // 一台蒸汽连弩车
+const HIDDEN = { base: '#6d6670', light: '#9a929c', dark: '#4a444d' };
 function drawShooter(x, y, r, sh, ang, alpha) {
-  const k = COL[sh.color];
+  const k = sh.hidden ? HIDDEN : COL[sh.color];
   const big = sh.big || 0;
   r *= 1 + 0.16 * big;
   if (sh.popT !== undefined && sh.popT < 0.3) r *= 1 + 0.35 * Math.sin((sh.popT / 0.3) * Math.PI);
@@ -2316,7 +2500,7 @@ function drawShooter(x, y, r, sh, ang, alpha) {
   ctx.strokeStyle = k.dark;
   ctx.stroke();
   // 子弹数
-  text(String(sh.ammo), 0, 1, Math.round(r * (sh.ammo >= 100 ? 0.62 : 0.8)), '#fff', 'center', INK);
+  text(sh.hidden ? '?' : String(sh.ammo), 0, 1, Math.round(r * (sh.ammo >= 100 ? 0.62 : 0.8)), '#fff', 'center', INK);
   ctx.restore();
 }
 
@@ -2352,6 +2536,12 @@ function drawTopBar() {
   ctx.strokeStyle = BRASS_D;
   ctx.stroke();
   text('第 ' + (S.levelNo + 1) + ' 关', 49, y + 1, 15, BRASS_L);
+  if (S.def.hard) {
+    rr(30, y + 14, 38, 18, 9);
+    ctx.fillStyle = '#c8323c';
+    ctx.fill();
+    text('难', 49, y + 23, 12, '#fff');
+  }
   // 这一关第几张图：两颗小灯
   const ns = g.stages.length;
   if (ns > 1) {
@@ -2583,7 +2773,9 @@ function drawColumns() {
       const y = colItemY(j);
       const bob = j === 0 ? Math.sin(S.time * 4 + c) * 1.5 : 0;
       const r = j === 0 ? 28 : 21 - j * 1.5;
-      drawShooter(x, y + bob, r, sh, -Math.PI / 2, j === 0 ? (can ? 1 : 0.6) : 0.75 - j * 0.12);
+      // 问号炮台：只露每列最前面那台，后面的排到最前面才翻开
+      const show = j > 0 && S.def.mystery ? { color: sh.color, ammo: sh.ammo, big: 0, hidden: true } : sh;
+      drawShooter(x, y + bob, r, show, -Math.PI / 2, j === 0 ? (can ? 1 : 0.6) : 0.75 - j * 0.12);
     }
     if (list.length > 5) text('+' + (list.length - 5), x, colItemY(5) - 6, 12, '#8a7a80');
   }
@@ -2594,7 +2786,59 @@ function drawColumns() {
     const t = (S.time % 1.2) / 1.2;
     const press = t < 0.3 ? t / 0.3 : t < 0.5 ? 1 : 1 - (t - 0.5) / 0.7;
     drawHand(x + 18, y + 30 - press * 10, press);
+    tipText('点炮台，放上传送带');
   }
+  if (S.tip2 > 0 && S.levelNo === 0) tipText('等它转一圈，自己会打同色的格子', Math.min(1, S.tip2 / 0.4));
+}
+
+// 教学字：棋盘和槽之间一条深色条（只有第 1 关有，一共两句）
+function tipText(str, alpha) {
+  const L = S.L;
+  const y = L.slotY - L.slotR - 16;
+  ctx.save();
+  ctx.globalAlpha = alpha === undefined ? 1 : alpha;
+  rr(W / 2 - 150, y - 15, 300, 30, 15);
+  ctx.fillStyle = 'rgba(20,12,18,0.82)';
+  ctx.fill();
+  text(str, W / 2, y + 1, 15, '#fff3c4');
+  ctx.restore();
+}
+
+// 新机制卡片（原作：整屏一张卡 + 大图 + 一句话 + 按钮）
+function drawCard() {
+  const c = S.card;
+  ctx.fillStyle = 'rgba(10,6,10,0.72)';
+  ctx.fillRect(0, 0, W, H);
+  const cw = Math.min(320, W - 40);
+  const ch = 300;
+  const x0 = (W - cw) / 2;
+  const y0 = H * 0.24;
+  rr(x0, y0, cw, ch, 22);
+  ctx.fillStyle = '#3a2a30';
+  ctx.fill();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = BRASS;
+  ctx.stroke();
+  text('新东西', W / 2, y0 + 32, 16, BRASS_L);
+  text('问号连弩', W / 2, y0 + 66, 26, '#fff3c4');
+  // 一台露脸的 + 两台问号
+  drawShooter(W / 2 - 70, y0 + 142, 30, { color: 4, ammo: 10, big: 0 });
+  drawShooter(W / 2, y0 + 142, 26, { color: 0, ammo: 0, big: 0, hidden: true });
+  drawShooter(W / 2 + 70, y0 + 142, 26, { color: 0, ammo: 0, big: 0, hidden: true });
+  text('排到最前面才翻开颜色', W / 2, y0 + 202, 16, '#e8dcc8');
+  const bw = 160, bh = 48, bx = W / 2 - bw / 2, by = y0 + ch - 70;
+  rr(bx, by, bw, bh, 24);
+  ctx.fillStyle = BRASS;
+  ctx.fill();
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  text('知道了', W / 2, by + bh / 2 + 1, 19, INK);
+  S.buttons.push({ id: 'card', x: bx, y: by, w: bw, h: bh, fn: () => {
+    save.seen[c.kind] = true;
+    persist();
+    S.card = null;
+  } });
 }
 
 function drawHand(x, y, press) {
@@ -3018,6 +3262,7 @@ function render() {
   }
   if (S.g.status === 'full') drawFailPanel();
   if (S.g.status === 'win') drawWinPanel();
+  if (S.card) drawCard();
   if (S.album.open) drawAlbum();
   if (S.toast) {
     rr(W / 2 - 120, H * 0.42, 240, 40, 20);
@@ -3039,7 +3284,7 @@ function onTouch(type, id, x, y) {
       return;
     }
   }
-  if (S.album.open) return;
+  if (S.album.open || S.card) return;
   const g = S.g;
   if (!g || g.status !== 'play') return;
   const L = S.L;
