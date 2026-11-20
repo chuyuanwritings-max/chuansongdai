@@ -1,0 +1,3859 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>爽三消</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #120d14; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; border-radius: 18px; box-shadow: 0 0 0 1px #3a2c22; }
+  @media (max-width: 520px) { canvas { border-radius: 0; box-shadow: none; } }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+// 极简 CommonJS：模拟微信小游戏的 require
+var __m = {}, __c = {};
+function __def(name, fn) { __m[name] = fn; }
+function __resolve(from, p) {
+  var parts = (from.indexOf('/') >= 0 ? from.slice(0, from.lastIndexOf('/')) : '').split('/').filter(Boolean);
+  p.split('/').forEach(function (s) { if (s === '..') parts.pop(); else if (s && s !== '.') parts.push(s); });
+  var k = parts.join('/');
+  return __m[k] ? k : k + '.js';
+}
+function __require(from) {
+  return function (p) {
+    var k = __resolve(from, p);
+    if (__c[k]) return __c[k].exports;
+    if (!__m[k]) throw new Error('找不到模块 ' + k);
+    var module = { exports: {} };
+    __c[k] = module;
+    __m[k](module, module.exports, __require(k));
+    return module.exports;
+  };
+}
+__def("game.js", function (module, exports, require) {
+// 微信小游戏入口。浏览器预览也从这里进（见 tools/build-preview.js）。
+require('./js/main.js');
+
+});
+__def("js/core.js", function (module, exports, require) {
+// 规则层：《爽三消》交换三消的全部规则。不画图、不碰平台，node 能直接跑（test/sim.js 用它）。
+//
+// 棋盘 g.cells[idx]：一块 = { id, c: 颜色 0..5（铜雀为 -1）, sp: 特效 }，或 null。
+// 特效 sp：0 普通 / 1 连弩横（消一行）/ 2 连弩竖（消一列）/ 3 齿轮炸弹（3×3）/ 4 铜雀（啄一种颜色）
+//          5 木鸢（2×2 方块凑出来；炸自己一圈后飞去撕一张还没撕的蓝图纸 —— 照 Royal Match 的竹蜻蜓，专治「最后几格够不着」）
+// g.paper[idx]：1 = 这格还盖着蓝图纸。在这格上消过一次就撕掉。全撕掉 = 过关。
+//
+// trySwap() 一次把整个连锁算完（棋盘直接变成最后的样子），
+// 同时交出一串「步骤」steps：每一步 = 这一轮消掉谁、生出什么特效、谁往下掉、上面补什么。
+// 画面层按步骤一步一步播动画，自己不用懂规则。
+
+const SP = { NONE: 0, H: 1, V: 2, BOMB: 3, BIRD: 4, KITE: 5 };
+
+// 可复现的随机数（同一个种子 = 同一局，方便测试）
+function makeRng(seed) {
+  let a = (seed >>> 0) || 1;
+  return function () {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// —— 开局 ——
+// def = { map: ['.......', ...]（'.' 有格子，其他字符 = 空洞）, moves, colors }
+function newGame(def, seed) {
+  const h = def.map.length;
+  const w = def.map[0].length;
+  const g = {
+    w,
+    h,
+    mask: new Uint8Array(w * h),
+    cells: new Array(w * h).fill(null),
+    paper: new Uint8Array(w * h),
+    paperTotal: 0,
+    paperLeft: 0,
+    moves: def.moves,
+    movesTotal: def.moves,
+    colors: def.colors || 6,
+    status: 'play', // play / win / lose
+    rnd: makeRng(seed === undefined ? (Math.random() * 1e9) | 0 : seed),
+    nextId: 1,
+    luck: def.luck || 0, // 补块时「顺手凑一下」的概率：前几关大方一点
+    chainKite: def.chainKite === undefined ? 3 : def.chainKite, // 连锁到几级开始送木鸢（0 = 不送）
+    stats: { moves: 0, steps: 0, specials: 0, made: 0, combos: 0, shuffles: 0, bonusKites: 0 },
+  };
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (def.map[y][x] === '.') {
+        const i = y * w + x;
+        g.mask[i] = 1;
+        g.paper[i] = 1;
+        g.paperTotal++;
+      }
+    }
+  }
+  g.paperLeft = g.paperTotal;
+  fillFresh(g);
+  return g;
+}
+
+function piece(g, c, sp) {
+  return { id: g.nextId++, c, sp: sp || 0 };
+}
+
+// 铺满一盘：没有现成的三连，并且至少有一步能消
+function fillFresh(g) {
+  for (let tries = 0; tries < 200; tries++) {
+    for (let i = 0; i < g.cells.length; i++) {
+      if (!g.mask[i]) continue;
+      const x = i % g.w;
+      const y = (i / g.w) | 0;
+      let c;
+      for (let k = 0; k < 20; k++) {
+        c = (g.rnd() * g.colors) | 0;
+        const l1 = x >= 2 && colorAt(g, i - 1) === c && colorAt(g, i - 2) === c;
+        const u1 = y >= 2 && colorAt(g, i - g.w) === c && colorAt(g, i - 2 * g.w) === c;
+        if (!l1 && !u1) break;
+      }
+      g.cells[i] = piece(g, c);
+    }
+    if (findGroups(g).length === 0 && findMoves(g).length >= 3) return;
+  }
+}
+
+function colorAt(g, i) {
+  const p = g.cells[i];
+  return p ? p.c : -9;
+}
+
+function valid(g, x, y) {
+  return x >= 0 && y >= 0 && x < g.w && y < g.h && g.mask[y * g.w + x] === 1;
+}
+
+// 能参与三连的颜色（铜雀不算颜色）
+function matchColor(g, i) {
+  const p = g.cells[i];
+  if (!p || p.sp === SP.BIRD) return -1;
+  return p.c;
+}
+
+// —— 找三连 ——
+// 返回若干组：{ cells: [idx], sp: 该生成的特效, hRuns, vRuns }
+// 同一行（列）连着的 ≥3 个算一段；共享格子的段合成一组（L / T 形就是横段 + 竖段）
+function findGroups(g) {
+  const n = g.cells.length;
+  const parent = new Int32Array(n).fill(-1);
+  const find = (a) => {
+    while (parent[a] !== a) {
+      parent[a] = parent[parent[a]];
+      a = parent[a];
+    }
+    return a;
+  };
+  const join = (a, b) => {
+    if (parent[a] < 0) parent[a] = a;
+    if (parent[b] < 0) parent[b] = b;
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent[ra] = rb;
+  };
+  const runs = [];
+  // 横
+  for (let y = 0; y < g.h; y++) {
+    let x = 0;
+    while (x < g.w) {
+      const c = matchColor(g, y * g.w + x);
+      let e = x + 1;
+      if (c >= 0) while (e < g.w && matchColor(g, y * g.w + e) === c) e++;
+      if (c >= 0 && e - x >= 3) {
+        const cells = [];
+        for (let k = x; k < e; k++) cells.push(y * g.w + k);
+        runs.push({ dir: 'h', cells });
+      }
+      x = e;
+    }
+  }
+  // 竖
+  for (let x = 0; x < g.w; x++) {
+    let y = 0;
+    while (y < g.h) {
+      const c = matchColor(g, y * g.w + x);
+      let e = y + 1;
+      if (c >= 0) while (e < g.h && matchColor(g, e * g.w + x) === c) e++;
+      if (c >= 0 && e - y >= 3) {
+        const cells = [];
+        for (let k = y; k < e; k++) cells.push(k * g.w + x);
+        runs.push({ dir: 'v', cells });
+      }
+      y = e;
+    }
+  }
+  // 2×2 方块（木鸢）
+  for (let y = 0; y + 1 < g.h; y++) {
+    for (let x = 0; x + 1 < g.w; x++) {
+      const i = y * g.w + x;
+      const c = matchColor(g, i);
+      if (c >= 0 && matchColor(g, i + 1) === c && matchColor(g, i + g.w) === c && matchColor(g, i + g.w + 1) === c) {
+        runs.push({ dir: 's', cells: [i, i + 1, i + g.w, i + g.w + 1] });
+      }
+    }
+  }
+  if (!runs.length) return [];
+  for (const r of runs) for (let k = 1; k < r.cells.length; k++) join(r.cells[0], r.cells[k]);
+  const byRoot = new Map();
+  for (const r of runs) {
+    const root = find(r.cells[0]);
+    if (!byRoot.has(root)) byRoot.set(root, { runs: [], set: new Set() });
+    const G = byRoot.get(root);
+    G.runs.push(r);
+    for (const c of r.cells) G.set.add(c);
+  }
+  const out = [];
+  for (const G of byRoot.values()) {
+    let maxH = 0;
+    let maxV = 0;
+    let sq = false;
+    for (const r of G.runs) {
+      if (r.dir === 'h') maxH = Math.max(maxH, r.cells.length);
+      else if (r.dir === 'v') maxV = Math.max(maxV, r.cells.length);
+      else sq = true;
+    }
+    let sp = SP.NONE;
+    if (maxH >= 5 || maxV >= 5) sp = SP.BIRD;
+    else if (maxH >= 3 && maxV >= 3) sp = SP.BOMB;
+    else if (maxH === 4) sp = SP.H;
+    else if (maxV === 4) sp = SP.V;
+    else if (sq) sp = SP.KITE;
+    out.push({ cells: Array.from(G.set), runs: G.runs, sp });
+  }
+  return out;
+}
+
+// 特效生在哪一格：优先玩家刚挪过的那格；L/T 放拐角；否则放最长那段的中间
+function placeSpecial(g, grp, pref) {
+  const ok = (i) => g.cells[i] && g.cells[i].sp === SP.NONE;
+  if (pref) for (const p of pref) if (grp.cells.indexOf(p) >= 0 && ok(p)) return p;
+  if (grp.sp === SP.BOMB) {
+    const hs = new Set();
+    for (const r of grp.runs) if (r.dir === 'h') r.cells.forEach((c) => hs.add(c));
+    for (const r of grp.runs) if (r.dir === 'v') for (const c of r.cells) if (hs.has(c) && ok(c)) return c;
+  }
+  let best = grp.runs[0];
+  for (const r of grp.runs) if (r.cells.length > best.cells.length || (best.dir === 's' && r.dir !== 's')) best = r;
+  const mid = best.cells[(best.cells.length - 1) >> 1];
+  if (ok(mid)) return mid;
+  for (const c of grp.cells) if (ok(c)) return c;
+  return -1;
+}
+
+// —— 一步之内：消、引爆、连带引爆 ——
+// 每个被消的格子有一个延迟 delay（秒），画面按延迟一个个炸开，看起来像连弩扫过去、炸弹一圈圈炸开
+function newStep(chain) {
+  return { chain, pops: [], upgrades: [], fx: [], torn: [], moves: [], spawns: [], made: [] };
+}
+
+function runStep(g, step, matched, acts, pref) {
+  const popped = new Map(); // idx -> delay
+  const protect = new Set(); // 这一步刚生出来的特效，不被同一步的爆炸带走
+  const queue = acts.slice();
+  claimed = new Set(); // 这一步已经有木鸢要去的格子（几只木鸢别抢同一格）
+
+  const pop = (idx, t, by) => {
+    if (!g.mask[idx]) return;
+    const p = g.cells[idx];
+    if (!p || popped.has(idx) || protect.has(idx)) return;
+    popped.set(idx, t);
+    step.pops.push({ id: p.id, idx, c: p.c, sp: p.sp, delay: t, by });
+    if (p.sp !== SP.NONE && !p.used) {
+      p.used = true;
+      g.stats.specials++;
+      if (p.sp === SP.BIRD) queue.push({ type: 'bird', idx, t: t + 0.08, c: mostColor(g, popped) });
+      else if (p.sp === SP.BOMB) queue.push({ type: 'bomb', idx, t: t + 0.06, r: 1 });
+      else if (p.sp === SP.KITE) queue.push({ type: 'kite', idx, t: t + 0.05 });
+      else queue.push({ type: p.sp === SP.H ? 'h' : 'v', idx, t: t + 0.04 });
+    }
+  };
+
+  // 1) 三连：整组消掉，该生特效的地方留一块升级
+  for (const grp of matched) {
+    let keep = -1;
+    if (grp.sp !== SP.NONE) {
+      keep = placeSpecial(g, grp, pref);
+      if (keep >= 0) {
+        const p = g.cells[keep];
+        p.sp = grp.sp;
+        if (grp.sp === SP.BIRD) p.c = -1;
+        protect.add(keep);
+        step.upgrades.push({ id: p.id, idx: keep, sp: p.sp, c: p.c, delay: 0 });
+        step.made.push(grp.sp);
+        g.stats.made++;
+      }
+    }
+    for (const c of grp.cells) if (c !== keep) pop(c, 0, 'match');
+  }
+
+  // 2) 引爆队列：按时间先后处理，引爆中碰到别的特效就接着引爆
+  while (queue.length) {
+    let k = 0;
+    for (let i = 1; i < queue.length; i++) if (queue[i].t < queue[k].t) k = i;
+    const a = queue.splice(k, 1)[0];
+    const x0 = a.idx % g.w;
+    const y0 = (a.idx / g.w) | 0;
+    step.fx.push({ type: a.type, idx: a.idx, t: a.t, r: a.r, c: a.c, sp: a.sp, targets: null });
+    const fx = step.fx[step.fx.length - 1];
+    if (a.type === 'h' || a.type === 'cross' || a.type === 'cross3') {
+      const rows = a.type === 'cross3' ? [y0 - 1, y0, y0 + 1] : [y0];
+      for (const y of rows) for (let x = 0; x < g.w; x++) if (valid(g, x, y)) pop(y * g.w + x, a.t + Math.abs(x - x0) * 0.035, 'line');
+    }
+    if (a.type === 'v' || a.type === 'cross' || a.type === 'cross3') {
+      const cols = a.type === 'cross3' ? [x0 - 1, x0, x0 + 1] : [x0];
+      for (const x of cols) for (let y = 0; y < g.h; y++) if (valid(g, x, y)) pop(y * g.w + x, a.t + Math.abs(y - y0) * 0.035, 'line');
+    }
+    if (a.type === 'bomb') {
+      for (let dy = -a.r; dy <= a.r; dy++) {
+        for (let dx = -a.r; dx <= a.r; dx++) {
+          if (valid(g, x0 + dx, y0 + dy)) pop((y0 + dy) * g.w + x0 + dx, a.t + Math.max(Math.abs(dx), Math.abs(dy)) * 0.04, 'bomb');
+        }
+      }
+    }
+    if (a.type === 'hit') pop(a.idx, a.t, 'finale');
+    if (a.type === 'kite') {
+      // 木鸢：先炸自己上下左右一圈，再飞去一张还没撕的纸（带着别的特效就到那里再引爆）
+      // idx < 0 = 连锁奖励：汐娘从工坊放出来的木鸢，不炸起点
+      if (a.idx >= 0) for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) if (valid(g, x0 + dx, y0 + dy)) pop((y0 + dy) * g.w + x0 + dx, a.t + 0.03, 'kite');
+      const to = kiteTarget(g, popped, a.idx);
+      fx.to = to;
+      if (to >= 0) {
+        const land = a.t + (a.idx < 0 ? 0.3 : 0.4); // 飞行时间（画面上木鸢飞这么久）
+        fx.land = land;
+        if (a.carry === SP.BOMB) queue.push({ type: 'bomb', idx: to, t: land, r: 1 });
+        else if (a.carry === SP.H || a.carry === SP.V) queue.push({ type: a.carry === SP.H ? 'h' : 'v', idx: to, t: land });
+        else pop(to, land, 'kite');
+        claimed.add(to);
+      }
+    }
+    if (a.type === 'bird') {
+      // 铜雀飞去啄掉所有这种颜色
+      const targets = [];
+      for (let i = 0; i < g.cells.length; i++) {
+        const p = g.cells[i];
+        if (p && p.c === a.c && p.sp !== SP.BIRD && !popped.has(i)) targets.push(i);
+      }
+      fx.targets = targets;
+      targets.forEach((i, n) => pop(i, a.t + 0.12 + n * 0.035, 'bird'));
+    }
+    if (a.type === 'birdfx') {
+      // 铜雀 + 特效：把那种颜色全变成这个特效，再一个个引爆
+      const targets = [];
+      for (let i = 0; i < g.cells.length; i++) {
+        const p = g.cells[i];
+        if (p && p.c === a.c && !popped.has(i) && !protect.has(i)) targets.push(i);
+      }
+      fx.targets = targets;
+      targets.forEach((i, n) => {
+        const p = g.cells[i];
+        if (p.sp === SP.NONE) {
+          p.sp = a.sp === SP.BOMB || a.sp === SP.KITE ? a.sp : g.rnd() < 0.5 ? SP.H : SP.V;
+          step.upgrades.push({ id: p.id, idx: i, sp: p.sp, c: p.c, delay: a.t + 0.1 + n * 0.04 });
+        }
+      });
+      targets.forEach((i, n) => pop(i, a.t + 0.55 + n * 0.07, 'bird'));
+    }
+    if (a.type === 'all') {
+      // 铜雀 + 铜雀：整盘清空
+      for (let i = 0; i < g.cells.length; i++) {
+        if (!g.mask[i]) continue;
+        const x = i % g.w;
+        const y = (i / g.w) | 0;
+        pop(i, a.t + 0.1 + (Math.abs(x - x0) + Math.abs(y - y0)) * 0.04, 'bird');
+      }
+    }
+  }
+
+  // 3) 真的拿掉、撕纸
+  for (const idx of popped.keys()) {
+    g.cells[idx] = null;
+    if (g.paper[idx]) {
+      g.paper[idx] = 0;
+      g.paperLeft--;
+      step.torn.push(idx);
+    }
+  }
+  // 刚升级成特效的格子也算「在这格上消过」
+  for (const u of step.upgrades) {
+    if (g.paper[u.idx] && g.cells[u.idx]) {
+      g.paper[u.idx] = 0;
+      g.paperLeft--;
+      step.torn.push(u.idx);
+    }
+  }
+  // 4) 往下掉 + 上面补
+  gravity(g, step);
+}
+
+let claimed = new Set();
+// 木鸢去哪：还盖着纸、这一步还没被炸到、别的木鸢没去的格子里，挑离得最远的那片（最难够着的角落）
+function kiteTarget(g, popped, from) {
+  let best = -1;
+  let bestV = -1;
+  const fx = from % g.w;
+  const fy = (from / g.w) | 0;
+  for (let i = 0; i < g.cells.length; i++) {
+    if (!g.mask[i] || !g.paper[i] || popped.has(i) || claimed.has(i) || !g.cells[i]) continue;
+    const x = i % g.w;
+    const y = (i / g.w) | 0;
+    const v = from < 0 ? g.rnd() : Math.abs(x - fx) + Math.abs(y - fy) + g.rnd() * 3;
+    if (v > bestV) {
+      bestV = v;
+      best = i;
+    }
+  }
+  if (best < 0) {
+    // 纸都撕完了：随便找一块
+    for (let k = 0; k < 30 && best < 0; k++) {
+      const i = (g.rnd() * g.cells.length) | 0;
+      if (g.cells[i] && !popped.has(i)) best = i;
+    }
+  }
+  return best;
+}
+
+// 场上最多的颜色（铜雀被炸到时用）
+function mostColor(g, popped) {
+  const cnt = new Array(g.colors).fill(0);
+  for (let i = 0; i < g.cells.length; i++) {
+    const p = g.cells[i];
+    if (p && p.c >= 0 && !(popped && popped.has(i))) cnt[p.c]++;
+  }
+  let best = 0;
+  for (let c = 1; c < cnt.length; c++) if (cnt[c] > cnt[best]) best = c;
+  return best;
+}
+
+// 每一列：有块的往下挤（空洞格跳过），顶上空出来的补新块
+function gravity(g, step) {
+  for (let x = 0; x < g.w; x++) {
+    const rows = [];
+    for (let y = 0; y < g.h; y++) if (g.mask[y * g.w + x]) rows.push(y);
+    if (!rows.length) continue;
+    let write = rows.length - 1;
+    for (let r = rows.length - 1; r >= 0; r--) {
+      const i = rows[r] * g.w + x;
+      const p = g.cells[i];
+      if (!p) continue;
+      const to = rows[write] * g.w + x;
+      if (to !== i) {
+        g.cells[to] = p;
+        g.cells[i] = null;
+        step.moves.push({ id: p.id, from: i, to });
+      }
+      write--;
+    }
+    const n = write + 1;
+    for (let r = 0; r < n; r++) {
+      const to = rows[r] * g.w + x;
+      const c = spawnColor(g, to);
+      const p = piece(g, c);
+      g.cells[to] = p;
+      // fromRow：从棋盘顶上排着队掉下来
+      step.spawns.push({ id: p.id, c, sp: 0, to, fromRow: rows[0] - n + r - 0.3 });
+    }
+  }
+}
+
+// 补的新块：一般随机；luck 概率下跟下面那块同色（更容易出连锁）
+function spawnColor(g, idx) {
+  if (g.luck > 0 && g.rnd() < g.luck) {
+    const below = idx + g.w;
+    if (below < g.cells.length && g.cells[below] && g.cells[below].c >= 0) return g.cells[below].c;
+  }
+  return (g.rnd() * g.colors) | 0;
+}
+
+// —— 玩家交换 ——
+// 返回 null（不能换：不相邻 / 没有块 / 局已结束），
+// { ok: false }（换了不成消，画面上弹回去，不扣步数），
+// { ok: true, steps, shuffle, status }（整串连锁）
+function trySwap(g, a, b) {
+  if (g.status !== 'play' || g.moves <= 0) return null;
+  if (a === b || a < 0 || b < 0 || a >= g.cells.length || b >= g.cells.length) return null;
+  const ax = a % g.w;
+  const ay = (a / g.w) | 0;
+  const bx = b % g.w;
+  const by = (b / g.w) | 0;
+  if (Math.abs(ax - bx) + Math.abs(ay - by) !== 1) return null;
+  const pa = g.cells[a];
+  const pb = g.cells[b];
+  if (!pa || !pb) return null;
+
+  const swapCells = () => {
+    g.cells[a] = pb;
+    g.cells[b] = pa;
+  };
+  let acts = null;
+  let first = null; // 第一步里直接被拿掉的那两块
+  if (pa.sp !== SP.NONE && pb.sp !== SP.NONE) {
+    // 两个特效块交换 = 组合技
+    swapCells();
+    acts = comboActs(g, pa, pb, b);
+    first = [a, b];
+    g.stats.combos++;
+  } else if (pa.sp === SP.BIRD || pb.sp === SP.BIRD) {
+    // 铜雀 + 普通块：啄掉所有那种颜色
+    swapCells();
+    const other = pa.sp === SP.BIRD ? pb : pa;
+    const birdIdx = pa.sp === SP.BIRD ? b : a;
+    acts = [{ type: 'bird', idx: birdIdx, t: 0.05, c: other.c }];
+    first = [birdIdx];
+  } else {
+    swapCells();
+    if (findGroups(g).length === 0) {
+      swapCells();
+      return { ok: false };
+    }
+  }
+  g.moves--;
+  g.stats.moves++;
+  const steps = [];
+  if (acts) {
+    const step = newStep(1);
+    // 组合技里两块本身：先标成已用（不再各自单独引爆），再拿掉
+    const pre = [];
+    for (const i of first) {
+      const p = g.cells[i];
+      if (p) {
+        p.used = true;
+        g.stats.specials += p.sp !== SP.NONE ? 1 : 0;
+        pre.push(i);
+      }
+    }
+    for (const i of pre) acts.push({ type: 'popself', idx: i, t: 0 });
+    runStepWithSelf(g, step, acts);
+    steps.push(step);
+  }
+  resolve(g, steps, acts ? null : [a, b]);
+  return finish(g, steps);
+}
+
+// 组合技：返回第一步的引爆列表（都从 b 这一格出发）
+function comboActs(g, pa, pb, at) {
+  const s1 = pa.sp;
+  const s2 = pb.sp;
+  const isLine = (s) => s === SP.H || s === SP.V;
+  if (s1 === SP.BIRD && s2 === SP.BIRD) return [{ type: 'all', idx: at, t: 0.05 }];
+  if (s1 === SP.BIRD || s2 === SP.BIRD) {
+    const other = s1 === SP.BIRD ? pb : pa;
+    return [{ type: 'birdfx', idx: at, t: 0.05, c: other.c, sp: other.sp }];
+  }
+  if (s1 === SP.KITE && s2 === SP.KITE) return [0, 1, 2].map((k) => ({ type: 'kite', idx: at, t: 0.05 + k * 0.08 }));
+  if (s1 === SP.KITE || s2 === SP.KITE) return [{ type: 'kite', idx: at, t: 0.05, carry: s1 === SP.KITE ? s2 : s1 }];
+  if (isLine(s1) && isLine(s2)) return [{ type: 'cross', idx: at, t: 0.05 }];
+  if (s1 === SP.BOMB && s2 === SP.BOMB) return [{ type: 'bomb', idx: at, t: 0.05, r: 2 }];
+  return [{ type: 'cross3', idx: at, t: 0.05 }]; // 连弩 + 炸弹：三行三列
+}
+
+// 组合技那一步：两块自己也要被拿掉（但不各自引爆）
+function runStepWithSelf(g, step, acts) {
+  const selfs = acts.filter((a) => a.type === 'popself');
+  const rest = acts.filter((a) => a.type !== 'popself');
+  // 先把两块本身记成被消（delay 0），再跑引爆
+  for (const s of selfs) {
+    const p = g.cells[s.idx];
+    if (!p) continue;
+    step.pops.push({ id: p.id, idx: s.idx, c: p.c, sp: p.sp, delay: 0, by: 'combo' });
+  }
+  // 为了让 runStep 不再重复处理这两块：暂时拿走，跑完再把纸撕掉
+  const removed = [];
+  for (const s of selfs) {
+    if (g.cells[s.idx]) {
+      removed.push(s.idx);
+      g.cells[s.idx] = null;
+    }
+  }
+  for (const i of removed) {
+    if (g.paper[i]) {
+      g.paper[i] = 0;
+      g.paperLeft--;
+      step.torn.push(i);
+    }
+  }
+  runStep(g, step, [], rest, null);
+}
+
+// 连锁：一直消到没有三连为止
+function resolve(g, steps, pref) {
+  for (let guard = 0; guard < 60; guard++) {
+    const groups = findGroups(g);
+    if (!groups.length) break;
+    const step = newStep(steps.length + 1);
+    // 连锁奖励：连到第 chainKite 级起，每级汐娘放一只木鸢去撕纸
+    const bonus = g.chainKite && step.chain >= g.chainKite ? [{ type: 'kite', idx: -1, t: 0.05 }] : [];
+    if (bonus.length) g.stats.bonusKites++;
+    runStep(g, step, groups, bonus, pref);
+    steps.push(step);
+    pref = null;
+  }
+}
+
+function finish(g, steps) {
+  g.stats.steps += steps.length;
+  let shuffle = null;
+  if (g.paperLeft <= 0) g.status = 'win';
+  else if (g.moves <= 0) g.status = 'lose';
+  else if (findMoves(g).length === 0) shuffle = doShuffle(g);
+  return { ok: true, steps, shuffle, status: g.status };
+}
+
+// —— 找能走的步 ——
+function runLen(g, i) {
+  const c = matchColor(g, i);
+  if (c < 0) return [0, 0];
+  const x = i % g.w;
+  const y = (i / g.w) | 0;
+  let l = x;
+  while (l > 0 && matchColor(g, i - (x - l) - 1) === c) l--;
+  let r = x;
+  while (r < g.w - 1 && matchColor(g, i + (r - x) + 1) === c) r++;
+  let u = y;
+  while (u > 0 && matchColor(g, (u - 1) * g.w + x) === c) u--;
+  let d = y;
+  while (d < g.h - 1 && matchColor(g, (d + 1) * g.w + x) === c) d++;
+  return [r - l + 1, d - u + 1];
+}
+
+// 这格是不是在一个同色 2×2 里
+function inSquare(g, i) {
+  const c = matchColor(g, i);
+  if (c < 0) return false;
+  const x = i % g.w;
+  const y = (i / g.w) | 0;
+  for (const [ox, oy] of [[0, 0], [-1, 0], [0, -1], [-1, -1]]) {
+    const x1 = x + ox;
+    const y1 = y + oy;
+    if (x1 < 0 || y1 < 0 || x1 + 1 >= g.w || y1 + 1 >= g.h) continue;
+    const k = y1 * g.w + x1;
+    if (matchColor(g, k) === c && matchColor(g, k + 1) === c && matchColor(g, k + g.w) === c && matchColor(g, k + g.w + 1) === c) return true;
+  }
+  return false;
+}
+
+// 所有能成消的交换：[{ a, b, score }]；score 越大越好（提示用最大的）
+function findMoves(g) {
+  const out = [];
+  for (let i = 0; i < g.cells.length; i++) {
+    if (!g.cells[i]) continue;
+    const x = i % g.w;
+    const y = (i / g.w) | 0;
+    for (const [dx, dy] of [[1, 0], [0, 1]]) {
+      if (!valid(g, x + dx, y + dy)) continue;
+      const j = (y + dy) * g.w + x + dx;
+      const p = g.cells[i];
+      const q = g.cells[j];
+      if (!q) continue;
+      if (p.sp !== SP.NONE && q.sp !== SP.NONE) {
+        out.push({ a: i, b: j, score: 20 });
+        continue;
+      }
+      if (p.sp === SP.BIRD || q.sp === SP.BIRD) {
+        out.push({ a: i, b: j, score: 15 });
+        continue;
+      }
+      // 换完看能不能成三连或 2×2
+      g.cells[i] = q;
+      g.cells[j] = p;
+      const ri = runLen(g, i);
+      const rj = runLen(g, j);
+      const qi = inSquare(g, i);
+      const qj = inSquare(g, j);
+      g.cells[i] = p;
+      g.cells[j] = q;
+      const si = Math.max(ri[0], ri[1]) >= 3 ? ri[0] + ri[1] : qi ? 4 : 0;
+      const sj = Math.max(rj[0], rj[1]) >= 3 ? rj[0] + rj[1] : qj ? 4 : 0;
+      if (si || sj) out.push({ a: i, b: j, score: si + sj + (p.sp || q.sp ? 4 : 0) });
+    }
+  }
+  return out;
+}
+
+function bestMove(g) {
+  const ms = findMoves(g);
+  let best = null;
+  for (const m of ms) if (!best || m.score > best.score) best = m;
+  return best;
+}
+
+// 没得走了：打乱重排（特效块也一起洗），直到没有现成三连且有路可走
+function doShuffle(g) {
+  const idxs = [];
+  for (let i = 0; i < g.cells.length; i++) if (g.cells[i]) idxs.push(i);
+  const before = new Map();
+  for (const i of idxs) before.set(g.cells[i].id, i);
+  const pieces = idxs.map((i) => g.cells[i]);
+  for (let tries = 0; tries < 300; tries++) {
+    for (let k = pieces.length - 1; k > 0; k--) {
+      const j = (g.rnd() * (k + 1)) | 0;
+      const t = pieces[k];
+      pieces[k] = pieces[j];
+      pieces[j] = t;
+    }
+    if (tries > 100) for (const p of pieces) if (p.sp === SP.NONE) p.c = (g.rnd() * g.colors) | 0;
+    idxs.forEach((i, k) => (g.cells[i] = pieces[k]));
+    if (findGroups(g).length === 0 && findMoves(g).length > 0) break;
+  }
+  g.stats.shuffles++;
+  const moves = [];
+  for (const i of idxs) {
+    const p = g.cells[i];
+    moves.push({ id: p.id, from: before.get(p.id), to: i, c: p.c });
+  }
+  return { moves };
+}
+
+// 过关收尾：场上剩下的特效块全部自己引爆（只是爽，不影响输赢）
+function finale(g) {
+  const acts = [];
+  let n = 0;
+  for (let i = 0; i < g.cells.length; i++) {
+    const p = g.cells[i];
+    if (p && p.sp !== SP.NONE) acts.push({ type: 'hit', idx: i, t: 0.1 + n++ * 0.18 });
+  }
+  if (!acts.length) return null;
+  const save = g.stats.specials;
+  const step = newStep(1);
+  runStep(g, step, [], acts, null);
+  g.stats.specials = save;
+  return step;
+}
+
+// 看广告加步数，接着打
+function addMoves(g, n) {
+  g.moves += n;
+  g.status = 'play';
+}
+
+// 「随手玩」的机器人：在所有能成消的交换里随便挑一个
+function botPick(g, rnd) {
+  const ms = findMoves(g);
+  if (!ms.length) return null;
+  return ms[(rnd() * ms.length) | 0];
+}
+
+module.exports = { SP, makeRng, newGame, findGroups, findMoves, bestMove, trySwap, addMoves, botPick, doShuffle, finale, valid };
+
+});
+__def("js/illust.js", function (module, exports, require) {
+// 清完一关露出的连载插画（占位：代码画的简单场景，赛璐璐平涂 + 深色描边）。
+// 画册：四格一页，集齐一页解锁一段小传（局外，可折叠不看）。
+// 以后换正式插画：draw(i) 换成画一张图片就行，别的不动。
+
+const C = {
+  ink: '#1a1220',
+  night: '#141b2d',
+  night2: '#24304d',
+  brass: '#d9a54c',
+  brassD: '#9a6b2a',
+  brassL: '#f5d58c',
+  copper: '#c26a3d',
+  steam: '#ece6dc',
+  lamp: '#ffcf6b',
+  mercury: '#a8ece8',
+  skin: '#f2c9a0',
+  hair: '#2a1a22',
+  jacket: '#3f6170',
+  jacketD: '#2b4450',
+  apron: '#7a4a2a',
+  red: '#d9484d',
+  wood: '#6b4630',
+  woodD: '#4a2f20',
+};
+
+const PAGES = [
+  {
+    title: '熬夜造一只铜雀',
+    bioTitle: '汐娘',
+    bio: '汐娘以前给方士炼丹，跟水银打了半辈子交道。逃出地宫后，她在机关城的后坊落了脚：别人怕水银，她拿它当润滑、当镜子、当会流的零件。她话不多，手很快。夜里后坊最亮的那盏灯，是她的。',
+  },
+  {
+    title: '城门那一夜',
+    bioTitle: '那一夜',
+    bio: '攻城机关长龙撞到第三道城门那晚，阿铸在城头守了一夜，以为守不住了。天快亮时，一只铜雀从后坊的方向飞来，撞进长龙的眼睛。阿铸后来才知道，那只铜雀是汐娘一夜没睡造出来的。最后一格画的是很久以前：墨非、汐娘、阿铸从秦陵地宫一路往上爬，看见了第一缕光。',
+  },
+];
+
+const CAPTIONS = ['后坊亮着灯', '水银会流', '流水线上的铜雀', '飞去城墙', '长龙到了城下', '铜雀来了', '天亮了', '很久以前'];
+
+function line(ctx, w) {
+  ctx.lineWidth = w;
+  ctx.strokeStyle = C.ink;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+}
+
+function sky(ctx, S, top, bottom) {
+  const g = ctx.createLinearGradient(0, 0, 0, S);
+  g.addColorStop(0, top);
+  g.addColorStop(1, bottom);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, S, S);
+}
+
+function stars(ctx, S, n, seed) {
+  let s = seed;
+  const r = () => ((s = (s * 16807) % 2147483647) / 2147483647);
+  ctx.fillStyle = '#fff6d8';
+  for (let i = 0; i < n; i++) {
+    const x = r() * S;
+    const y = r() * S * 0.5;
+    const z = r() < 0.2 ? 2 : 1;
+    ctx.globalAlpha = 0.4 + r() * 0.6;
+    ctx.fillRect(x, y, z * S / 200, z * S / 200);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function gear(ctx, cx, cy, r, teeth, fill, rot, lw) {
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(rot || 0);
+  ctx.beginPath();
+  for (let i = 0; i < teeth * 2; i++) {
+    const a = (i / (teeth * 2)) * Math.PI * 2;
+    const rr = i % 2 === 0 ? r : r * 0.8;
+    const a2 = a + Math.PI / teeth;
+    ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+    ctx.lineTo(Math.cos(a2) * rr, Math.sin(a2) * rr);
+  }
+  ctx.closePath();
+  ctx.fillStyle = fill;
+  ctx.fill();
+  line(ctx, lw);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(0, 0, r * 0.3, 0, Math.PI * 2);
+  ctx.fillStyle = C.ink;
+  ctx.fill();
+  ctx.restore();
+}
+
+function puff(ctx, x, y, r, a) {
+  ctx.globalAlpha = a === undefined ? 0.85 : a;
+  ctx.fillStyle = C.steam;
+  for (const [dx, dy, k] of [[0, 0, 1], [r * 0.8, r * 0.2, 0.75], [-r * 0.8, r * 0.25, 0.7], [r * 0.3, -r * 0.5, 0.7]]) {
+    ctx.beginPath();
+    ctx.arc(x + dx, y + dy, r * k, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// 汐娘：护目镜推在额头上、发髻插一根铜簪、卷起袖子、工具带。s = 身高
+function xiniang(ctx, x, y, s, pose) {
+  const u = s / 10;
+  const lw = Math.max(1.5, u * 0.35);
+  ctx.save();
+  ctx.translate(x, y);
+  // 腿 / 裤
+  ctx.fillStyle = C.jacketD;
+  ctx.beginPath();
+  ctx.moveTo(-1.6 * u, 0);
+  ctx.lineTo(-1.2 * u, -3.2 * u);
+  ctx.lineTo(1.2 * u, -3.2 * u);
+  ctx.lineTo(1.6 * u, 0);
+  ctx.closePath();
+  ctx.fill();
+  line(ctx, lw);
+  ctx.stroke();
+  // 身子（短上衣）
+  ctx.fillStyle = C.jacket;
+  ctx.beginPath();
+  ctx.moveTo(-1.7 * u, -3 * u);
+  ctx.lineTo(-1.4 * u, -6.4 * u);
+  ctx.lineTo(1.4 * u, -6.4 * u);
+  ctx.lineTo(1.7 * u, -3 * u);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  // 工具带
+  ctx.fillStyle = C.apron;
+  ctx.fillRect(-1.75 * u, -3.6 * u, 3.5 * u, 0.7 * u);
+  ctx.strokeRect(-1.75 * u, -3.6 * u, 3.5 * u, 0.7 * u);
+  ctx.fillStyle = C.brass;
+  ctx.fillRect(-0.3 * u, -3.55 * u, 0.6 * u, 0.6 * u);
+  ctx.fillRect(0.9 * u, -3.4 * u, 0.4 * u, 1.1 * u); // 挂着的扳手
+  // 手臂（卷袖子：前臂露出皮肤）
+  const arm = (sx, raise) => {
+    ctx.strokeStyle = C.ink;
+    ctx.lineWidth = u * 0.95;
+    ctx.beginPath();
+    ctx.moveTo(sx * 1.4 * u, -6 * u);
+    const ex = sx * (raise ? 2.2 : 1.9) * u;
+    const ey = raise ? -7.4 * u : -4.4 * u;
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+    ctx.strokeStyle = C.jacket;
+    ctx.lineWidth = u * 0.6;
+    ctx.stroke();
+    ctx.strokeStyle = C.ink;
+    ctx.lineWidth = u * 0.8;
+    ctx.beginPath();
+    ctx.moveTo(ex, ey);
+    const hx = sx * (raise ? 2.6 : 2.0) * u;
+    const hy = raise ? -8.8 * u : -3.2 * u;
+    ctx.lineTo(hx, hy);
+    ctx.stroke();
+    ctx.strokeStyle = C.skin;
+    ctx.lineWidth = u * 0.45;
+    ctx.stroke();
+    return [hx, hy];
+  };
+  arm(-1, false);
+  const hand = arm(1, pose === 'work');
+  if (pose === 'work') {
+    // 手里一颗水银珠
+    ctx.fillStyle = C.mercury;
+    ctx.beginPath();
+    ctx.arc(hand[0], hand[1] - 0.6 * u, 0.6 * u, 0, Math.PI * 2);
+    ctx.fill();
+    line(ctx, lw * 0.7);
+    ctx.stroke();
+  }
+  // 头
+  ctx.fillStyle = C.skin;
+  ctx.beginPath();
+  ctx.arc(0, -7.6 * u, 1.25 * u, 0, Math.PI * 2);
+  ctx.fill();
+  line(ctx, lw);
+  ctx.stroke();
+  // 头发 + 发髻 + 铜簪
+  ctx.fillStyle = C.hair;
+  ctx.beginPath();
+  ctx.arc(0, -7.9 * u, 1.3 * u, Math.PI * 1.02, Math.PI * 1.98);
+  ctx.lineTo(1.25 * u, -7.4 * u);
+  ctx.lineTo(-1.25 * u, -7.4 * u);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(0.6 * u, -9.2 * u, 0.7 * u, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.strokeStyle = C.brass;
+  ctx.lineWidth = u * 0.22;
+  ctx.beginPath();
+  ctx.moveTo(-0.3 * u, -9.9 * u);
+  ctx.lineTo(1.6 * u, -8.7 * u);
+  ctx.stroke();
+  // 护目镜（推在额头）
+  for (const gx of [-0.55, 0.55]) {
+    ctx.fillStyle = C.brass;
+    ctx.beginPath();
+    ctx.arc(gx * 0.85 * u, -9.0 * u, 0.4 * u, 0, Math.PI * 2);
+    ctx.fill();
+    line(ctx, lw * 0.6);
+    ctx.stroke();
+    ctx.fillStyle = C.mercury;
+    ctx.beginPath();
+    ctx.arc(gx * 0.85 * u, -9.0 * u, 0.22 * u, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // 眼睛
+  ctx.fillStyle = C.ink;
+  ctx.fillRect(-0.62 * u, -7.7 * u, 0.28 * u, 0.42 * u);
+  ctx.fillRect(0.34 * u, -7.7 * u, 0.28 * u, 0.42 * u);
+  ctx.fillStyle = '#e88a8a';
+  ctx.fillRect(-0.9 * u, -7.15 * u, 0.35 * u, 0.18 * u);
+  ctx.fillRect(0.55 * u, -7.15 * u, 0.35 * u, 0.18 * u);
+  ctx.restore();
+}
+
+// 阿铸：宽肩、扛铜锤
+function azhu(ctx, x, y, s) {
+  const u = s / 10;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.fillStyle = '#5a3a2a';
+  ctx.beginPath();
+  ctx.moveTo(-2.4 * u, 0);
+  ctx.lineTo(-2.8 * u, -6.5 * u);
+  ctx.lineTo(2.8 * u, -6.5 * u);
+  ctx.lineTo(2.4 * u, 0);
+  ctx.closePath();
+  ctx.fill();
+  line(ctx, Math.max(1.5, u * 0.35));
+  ctx.stroke();
+  ctx.fillStyle = C.skin;
+  ctx.beginPath();
+  ctx.arc(0, -7.8 * u, 1.4 * u, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = C.hair;
+  ctx.fillRect(-1.4 * u, -9.3 * u, 2.8 * u, 0.9 * u);
+  // 铜锤
+  ctx.strokeStyle = C.woodD;
+  ctx.lineWidth = u * 0.5;
+  ctx.beginPath();
+  ctx.moveTo(2.2 * u, -5 * u);
+  ctx.lineTo(3.8 * u, -10 * u);
+  ctx.stroke();
+  ctx.fillStyle = C.copper;
+  ctx.fillRect(2.6 * u, -11.6 * u, 2.6 * u, 1.8 * u);
+  line(ctx, Math.max(1.5, u * 0.35));
+  ctx.strokeRect(2.6 * u, -11.6 * u, 2.6 * u, 1.8 * u);
+  ctx.restore();
+}
+
+// 铜雀：黄铜小鸟，齿轮翅膀
+function bird(ctx, x, y, s, rot) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(rot || 0);
+  const u = s / 10;
+  ctx.fillStyle = C.brass;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 4 * u, 2.4 * u, 0, 0, Math.PI * 2);
+  ctx.fill();
+  line(ctx, Math.max(1.2, u * 0.4));
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(4 * u, -0.5 * u);
+  ctx.lineTo(6 * u, 0.2 * u);
+  ctx.lineTo(4 * u, 0.9 * u);
+  ctx.fillStyle = C.copper;
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(-3.6 * u, 0);
+  ctx.lineTo(-6.5 * u, -1.6 * u);
+  ctx.lineTo(-6 * u, 1 * u);
+  ctx.closePath();
+  ctx.fillStyle = C.brassD;
+  ctx.fill();
+  ctx.stroke();
+  gear(ctx, -0.5 * u, -1.8 * u, 2.6 * u, 8, C.brassL, 0.3, Math.max(1, u * 0.3));
+  ctx.fillStyle = C.mercury;
+  ctx.beginPath();
+  ctx.arc(2.4 * u, -0.5 * u, 0.6 * u, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function wall(ctx, S, y, color) {
+  ctx.fillStyle = color;
+  ctx.fillRect(0, y, S, S - y);
+  const m = S / 12;
+  for (let x = 0; x < S; x += m * 2) ctx.fillRect(x, y - m * 0.6, m, m * 0.6);
+  line(ctx, S / 160);
+  ctx.beginPath();
+  ctx.moveTo(0, y);
+  for (let x = 0; x < S; x += m * 2) {
+    ctx.lineTo(x, y);
+    ctx.lineTo(x, y - m * 0.6);
+    ctx.lineTo(x + m, y - m * 0.6);
+    ctx.lineTo(x + m, y);
+  }
+  ctx.lineTo(S, y);
+  ctx.stroke();
+}
+
+function dragon(ctx, S, x, y, k, glow) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(k, k);
+  ctx.fillStyle = '#2b2a36';
+  ctx.beginPath();
+  ctx.moveTo(-S * 0.5, S * 0.1);
+  ctx.quadraticCurveTo(-S * 0.2, -S * 0.25, S * 0.1, -S * 0.2);
+  ctx.lineTo(S * 0.35, -S * 0.32);
+  ctx.lineTo(S * 0.3, -S * 0.18);
+  ctx.lineTo(S * 0.45, -S * 0.1);
+  ctx.lineTo(S * 0.2, -S * 0.02);
+  ctx.quadraticCurveTo(-S * 0.1, S * 0.05, -S * 0.5, S * 0.3);
+  ctx.closePath();
+  ctx.fill();
+  line(ctx, S / 120);
+  ctx.stroke();
+  for (let i = 0; i < 5; i++) gear(ctx, -S * 0.35 + i * S * 0.08, S * 0.05 - i * S * 0.04, S * 0.03, 6, '#4a4656', i, S / 200);
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.arc(S * 0.22, -S * 0.17, S * 0.025, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+const SCENES = [
+  // 0 后坊亮着灯
+  (ctx, S) => {
+    sky(ctx, S, C.night, C.night2);
+    stars(ctx, S, 40, 7);
+    ctx.fillStyle = '#fff3c4';
+    ctx.beginPath();
+    ctx.arc(S * 0.8, S * 0.18, S * 0.07, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#1c2236';
+    for (let i = 0; i < 6; i++) ctx.fillRect(i * S * 0.18 - S * 0.05, S * (0.55 - (i % 3) * 0.05), S * 0.16, S);
+    // 工坊
+    ctx.fillStyle = C.wood;
+    ctx.fillRect(S * 0.2, S * 0.45, S * 0.55, S * 0.4);
+    line(ctx, S / 100);
+    ctx.strokeRect(S * 0.2, S * 0.45, S * 0.55, S * 0.4);
+    ctx.fillStyle = C.woodD;
+    ctx.beginPath();
+    ctx.moveTo(S * 0.15, S * 0.46);
+    ctx.lineTo(S * 0.475, S * 0.3);
+    ctx.lineTo(S * 0.8, S * 0.46);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = C.brass;
+    ctx.fillRect(S * 0.62, S * 0.22, S * 0.07, S * 0.18);
+    ctx.strokeRect(S * 0.62, S * 0.22, S * 0.07, S * 0.18);
+    puff(ctx, S * 0.66, S * 0.17, S * 0.05);
+    puff(ctx, S * 0.72, S * 0.09, S * 0.04, 0.6);
+    ctx.fillStyle = C.lamp;
+    ctx.fillRect(S * 0.28, S * 0.55, S * 0.14, S * 0.12);
+    ctx.fillRect(S * 0.52, S * 0.55, S * 0.14, S * 0.12);
+    ctx.strokeRect(S * 0.28, S * 0.55, S * 0.14, S * 0.12);
+    ctx.strokeRect(S * 0.52, S * 0.55, S * 0.14, S * 0.12);
+    gear(ctx, S * 0.24, S * 0.82, S * 0.08, 10, C.brass, 0.2, S / 120);
+    ctx.fillStyle = '#0f1320';
+    ctx.fillRect(0, S * 0.86, S, S * 0.14);
+    xiniang(ctx, S * 0.35, S * 0.665, S * 0.1, 'stand');
+  },
+  // 1 水银会流
+  (ctx, S) => {
+    sky(ctx, S, '#3a2a24', '#1d1418');
+    const g = ctx.createRadialGradient(S * 0.5, S * 0.3, 0, S * 0.5, S * 0.3, S * 0.6);
+    g.addColorStop(0, 'rgba(255,207,107,0.55)');
+    g.addColorStop(1, 'rgba(255,207,107,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, S, S);
+    gear(ctx, S * 0.12, S * 0.2, S * 0.12, 12, C.brassD, 0.1, S / 120);
+    gear(ctx, S * 0.88, S * 0.32, S * 0.09, 10, C.brassD, 0.4, S / 120);
+    // 工作台
+    ctx.fillStyle = C.wood;
+    ctx.fillRect(S * 0.05, S * 0.72, S * 0.9, S * 0.08);
+    line(ctx, S / 100);
+    ctx.strokeRect(S * 0.05, S * 0.72, S * 0.9, S * 0.08);
+    ctx.fillStyle = C.woodD;
+    ctx.fillRect(S * 0.1, S * 0.8, S * 0.05, S * 0.2);
+    ctx.fillRect(S * 0.85, S * 0.8, S * 0.05, S * 0.2);
+    xiniang(ctx, S * 0.42, S * 0.72, S * 0.48, 'work');
+    // 飘起来的水银珠
+    for (let i = 0; i < 7; i++) {
+      const a = i * 0.9;
+      const x = S * (0.6 + 0.18 * Math.cos(a));
+      const y = S * (0.32 + 0.14 * Math.sin(a * 1.3));
+      ctx.fillStyle = C.mercury;
+      ctx.beginPath();
+      ctx.arc(x, y, S * (0.012 + (i % 3) * 0.006), 0, Math.PI * 2);
+      ctx.fill();
+      line(ctx, S / 260);
+      ctx.stroke();
+    }
+    // 台上的灯
+    ctx.fillStyle = C.lamp;
+    ctx.beginPath();
+    ctx.arc(S * 0.8, S * 0.66, S * 0.04, 0, Math.PI * 2);
+    ctx.fill();
+    line(ctx, S / 160);
+    ctx.stroke();
+  },
+  // 2 流水线上的铜雀
+  (ctx, S) => {
+    sky(ctx, S, '#2b2230', '#171019');
+    gear(ctx, S * 0.25, S * 0.25, S * 0.2, 14, '#5a4632', 0.05, S / 120);
+    gear(ctx, S * 0.62, S * 0.18, S * 0.13, 11, '#5a4632', 0.3, S / 120);
+    gear(ctx, S * 0.85, S * 0.38, S * 0.1, 9, '#5a4632', 0.7, S / 120);
+    // 传送带
+    ctx.fillStyle = '#2a2028';
+    ctx.fillRect(0, S * 0.62, S, S * 0.1);
+    line(ctx, S / 100);
+    ctx.strokeRect(-2, S * 0.62, S + 4, S * 0.1);
+    ctx.fillStyle = C.brass;
+    for (let x = 0; x < S; x += S / 10) {
+      ctx.beginPath();
+      ctx.arc(x + S / 20, S * 0.67, S * 0.03, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+    // 零件
+    gear(ctx, S * 0.15, S * 0.58, S * 0.04, 8, C.copper, 0, S / 160);
+    ctx.fillStyle = C.brassL;
+    ctx.fillRect(S * 0.3, S * 0.55, S * 0.08, S * 0.06);
+    ctx.strokeRect(S * 0.3, S * 0.55, S * 0.08, S * 0.06);
+    bird(ctx, S * 0.6, S * 0.54, S * 0.12, 0);
+    puff(ctx, S * 0.75, S * 0.48, S * 0.04, 0.5);
+    xiniang(ctx, S * 0.85, S * 0.92, S * 0.26, 'stand');
+    ctx.fillStyle = '#0f0b10';
+    ctx.fillRect(0, S * 0.92, S, S * 0.08);
+  },
+  // 3 飞去城墙
+  (ctx, S) => {
+    sky(ctx, S, '#1a2440', '#3a3a5c');
+    stars(ctx, S, 30, 11);
+    ctx.fillStyle = '#2a3048';
+    ctx.fillRect(0, S * 0.72, S, S * 0.3);
+    wall(ctx, S, S * 0.74, '#3a3446');
+    // 窗框
+    ctx.strokeStyle = C.woodD;
+    ctx.lineWidth = S * 0.05;
+    ctx.strokeRect(S * 0.03, S * 0.03, S * 0.94, S * 0.94);
+    ctx.lineWidth = S * 0.02;
+    ctx.beginPath();
+    ctx.moveTo(S * 0.5, S * 0.03);
+    ctx.lineTo(S * 0.5, S * 0.97);
+    ctx.stroke();
+    // 尾迹
+    ctx.strokeStyle = 'rgba(255,207,107,0.7)';
+    ctx.lineWidth = S * 0.012;
+    ctx.setLineDash([S * 0.03, S * 0.02]);
+    ctx.beginPath();
+    ctx.moveTo(S * 0.2, S * 0.8);
+    ctx.quadraticCurveTo(S * 0.35, S * 0.35, S * 0.68, S * 0.4);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    bird(ctx, S * 0.7, S * 0.4, S * 0.13, -0.15);
+  },
+  // 4 长龙到了城下
+  (ctx, S) => {
+    sky(ctx, S, '#2a1424', '#5a2a2a');
+    ctx.fillStyle = 'rgba(255,120,60,0.25)';
+    ctx.fillRect(0, S * 0.5, S, S * 0.5);
+    dragon(ctx, S, S * 0.45, S * 0.55, 1.1, '#ff4040');
+    wall(ctx, S, S * 0.72, '#4a3a3a');
+    azhu(ctx, S * 0.3, S * 0.72, S * 0.2);
+    ctx.fillStyle = '#1a0f12';
+    ctx.fillRect(0, S * 0.9, S, S * 0.1);
+  },
+  // 5 铜雀来了
+  (ctx, S) => {
+    sky(ctx, S, '#2a1a34', '#6a3a3a');
+    dragon(ctx, S, S * 0.5, S * 0.55, 1.1, '#fff2a0');
+    const g = ctx.createRadialGradient(S * 0.74, S * 0.36, 0, S * 0.74, S * 0.36, S * 0.25);
+    g.addColorStop(0, 'rgba(255,240,180,0.95)');
+    g.addColorStop(1, 'rgba(255,240,180,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, S, S);
+    bird(ctx, S * 0.7, S * 0.38, S * 0.11, 0.5);
+    wall(ctx, S, S * 0.74, '#4a3a3a');
+    azhu(ctx, S * 0.25, S * 0.74, S * 0.2);
+  },
+  // 6 天亮了
+  (ctx, S) => {
+    sky(ctx, S, '#ffd9a0', '#f2a46a');
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.beginPath();
+    ctx.moveTo(S * 0.7, 0);
+    ctx.lineTo(S, 0);
+    ctx.lineTo(S * 0.5, S);
+    ctx.lineTo(S * 0.2, S);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = C.wood;
+    ctx.fillRect(0, S * 0.65, S, S * 0.1);
+    line(ctx, S / 100);
+    ctx.strokeRect(-2, S * 0.65, S + 4, S * 0.1);
+    // 趴在桌上睡着的汐娘（头 + 手臂）
+    ctx.fillStyle = C.jacket;
+    ctx.beginPath();
+    ctx.ellipse(S * 0.42, S * 0.63, S * 0.2, S * 0.07, 0, Math.PI, 0);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = C.hair;
+    ctx.beginPath();
+    ctx.arc(S * 0.42, S * 0.57, S * 0.08, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(S * 0.47, S * 0.49, S * 0.04, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.strokeStyle = C.brass;
+    ctx.lineWidth = S * 0.012;
+    ctx.beginPath();
+    ctx.moveTo(S * 0.42, S * 0.47);
+    ctx.lineTo(S * 0.54, S * 0.51);
+    ctx.stroke();
+    bird(ctx, S * 0.7, S * 0.6, S * 0.08, 0);
+    puff(ctx, S * 0.2, S * 0.5, S * 0.05, 0.5);
+    ctx.fillStyle = C.ink;
+    ctx.font = `bold ${Math.round(S * 0.06)}px sans-serif`;
+    ctx.fillText('z', S * 0.55, S * 0.42);
+    ctx.fillText('z', S * 0.6, S * 0.35);
+  },
+  // 7 很久以前（祖师页：地宫水墨）
+  (ctx, S) => {
+    sky(ctx, S, '#e9e4d8', '#b9b2a4');
+    const g = ctx.createRadialGradient(S * 0.5, 0, 0, S * 0.5, 0, S * 0.7);
+    g.addColorStop(0, 'rgba(255,255,240,1)');
+    g.addColorStop(1, 'rgba(255,255,240,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, S, S);
+    ctx.fillStyle = 'rgba(30,26,30,0.85)';
+    for (let i = 0; i < 7; i++) {
+      ctx.fillRect(S * (0.1 + i * 0.06), S * (0.95 - i * 0.1), S * (0.8 - i * 0.1), S * 0.1);
+    }
+    ctx.fillStyle = '#1a1416';
+    const fig = (x, y, h) => {
+      ctx.beginPath();
+      ctx.arc(x, y - h, h * 0.18, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillRect(x - h * 0.15, y - h * 0.82, h * 0.3, h * 0.82);
+    };
+    fig(S * 0.42, S * 0.36, S * 0.12);
+    fig(S * 0.52, S * 0.46, S * 0.11);
+    fig(S * 0.62, S * 0.56, S * 0.14);
+    ctx.fillStyle = C.red;
+    ctx.fillRect(S * 0.46, S * 0.38, S * 0.12, S * 0.012); // 汐娘的红腰带（《墨》里）
+  },
+];
+
+function draw(ctx, i, S) {
+  ctx.save();
+  SCENES[i % SCENES.length](ctx, S);
+  ctx.restore();
+}
+
+module.exports = { draw, PAGES, CAPTIONS, COUNT: SCENES.length, bird, gear, puff, xiniang, C };
+
+});
+__def("js/levels.js", function (module, exports, require) {
+// 6 关。map：'.' = 有格子（底下盖蓝图纸），'#' = 空洞。moves = 步数，colors = 几种块，luck = 补块顺手凑连锁的概率，chainKite = 连锁到第几级起每级送一只木鸢。
+// 前 3 关几乎输不了；第 4 关起稍紧。数值由 test/sim.js 调出来。
+module.exports = [
+  {
+    // 第 1 关：7×7 小盘，必过（只用 5 种块，连锁多）
+    map: ['.......', '.......', '.......', '.......', '.......', '.......', '.......'],
+    moves: 25,
+    colors: 5,
+    luck: 0.2,
+    chainKite: 2,
+  },
+  {
+    // 第 2 关：8×8 整盘
+    map: ['........', '........', '........', '........', '........', '........', '........', '........'],
+    moves: 27,
+    colors: 6,
+    luck: 0.35,
+    chainKite: 2,
+  },
+  {
+    // 第 3 关：缺四个角
+    map: ['#......#', '........', '........', '........', '........', '........', '........', '........', '#......#'],
+    moves: 28,
+    colors: 6,
+    luck: 0.35,
+    chainKite: 2,
+  },
+  {
+    // 第 4 关：中间一个空洞
+    map: ['........', '........', '........', '...##...', '...##...', '...##...', '........', '........', '........'],
+    moves: 23,
+    colors: 6,
+    luck: 0.38,
+    chainKite: 2,
+  },
+  {
+    // 第 5 关：沙漏（两边各缺一块）
+    map: ['........', '........', '#......#', '##....##', '##....##', '##....##', '#......#', '........', '........'],
+    moves: 21,
+    colors: 6,
+    luck: 0.36,
+    chainKite: 2,
+  },
+  {
+    // 第 6 关：整盘 8×9，四角 + 两侧小缺口
+    map: ['##....##', '#......#', '........', '........', '#......#', '........', '........', '#......#', '##....##'],
+    moves: 19,
+    colors: 6,
+    luck: 0.36,
+    chainKite: 2,
+  },
+];
+
+});
+__def("js/main.js", function (module, exports, require) {
+// 主程序：画面、手势、动画、特效、过关 / 失败页、画册。规则全在 core.js（这里只按 core 交出来的「步骤」播动画）。
+const P = require('./platform.js');
+const core = require('./core.js');
+const LEVELS = require('./levels.js');
+const ART = require('./illust.js');
+const SP = core.SP;
+
+// 6 种块：底色 / 亮色 / 暗色（赛璐璐一档阴影）
+const PAL = [
+  { name: '铜铃', base: '#ec4a50', light: '#ffa3a3', dark: '#a8262e' },
+  { name: '齿轮', base: '#f5922a', light: '#ffd08f', dark: '#b0560f' },
+  { name: '灯笼', base: '#f9d23c', light: '#fff4a8', dark: '#b88f10' },
+  { name: '竹简', base: '#52c463', light: '#b8f2b4', dark: '#23813a' },
+  { name: '水银', base: '#3fd0e0', light: '#c2f8fb', dark: '#17808f' },
+  { name: '螺母', base: '#a06ae6', light: '#dcc2ff', dark: '#5c33a0' },
+];
+const INK = '#1a1220';
+const BRASS = '#d9a54c';
+const BRASS_D = '#8a5f26';
+const BRASS_L = '#f7dc98';
+const FONT = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif';
+const STEP = 1 / 60;
+const SAVE_KEY = 'sxx_a_v1';
+const GRAV = 75; // 下落加速度（格/秒²）
+const VMAX = 22;
+
+const scr = P.setup(onTouch);
+const ctx = scr.ctx;
+const W = scr.width;
+const H = scr.height;
+const DPR = scr.dpr;
+
+const save = Object.assign({ level: 0, coins: 0, album: [], tut: false }, P.load(SAVE_KEY) || {});
+function persist() {
+  P.save(SAVE_KEY, save);
+}
+
+const S = {
+  time: 0,
+  timeScale: 1, // 测试机器人用：快进
+  levelNo: 0,
+  def: null,
+  g: null,
+  L: null,
+  V: new Map(), // 画面上的块：id -> { c, sp, x, y（格坐标）, mode, ... }
+  dying: [],
+  parts: [],
+  fx: [],
+  texts: [],
+  paperVis: null, // 画面上还盖着纸的格子（比规则层慢半拍，跟着动画撕）
+  phase: 'intro', // intro / idle / swap / back / steps / shuffle / win / lose
+  phaseT: 0,
+  swap: null,
+  result: null,
+  stepI: 0,
+  step: null,
+  stepT: 0,
+  stepK: 1,
+  stepState: 'pop',
+  ev: [],
+  evI: 0,
+  stepEnd: 0,
+  inFinale: false,
+  sel: -1,
+  drag: null,
+  idleT: 0,
+  hint: null,
+  hitstop: 0,
+  shake: 0,
+  flash: 0,
+  cheer: 0,
+  endT: 0,
+  reward: 0,
+  adsUsed: 0,
+  ad: null,
+  albumOpen: false,
+  buttons: [],
+  popSnd: 0,
+  popSndT: -1,
+  tearSndT: -1,
+  stats: { loseWall: 0, readyWall: 0, swaps: 0, maxChain: 0, fx: 0 },
+  illus: null,
+  paperTex: null,
+  frameTex: null,
+};
+
+// —— 布局 ——
+function layout(g) {
+  const top = Math.max(8, scr.safeTop + 4);
+  const hudH = 76;
+  const cs = Math.floor(Math.min((W - 22) / Math.max(g.w, 7), (H - top - hudH - 250) / g.h, 50));
+  const bw = cs * g.w;
+  const bh = cs * g.h;
+  const bx = Math.round((W - bw) / 2);
+  const by = Math.round(top + hudH + 12);
+  const shopTop = by + bh + 18;
+  return { top, hudH, cs, bw, bh, bx, by, shopTop, launch: { x: W * 0.66, y: H - 30 - Math.min(80, (H - shopTop) * 0.36) } };
+}
+
+function cellXY(idx) {
+  const g = S.g;
+  return { x: idx % g.w, y: (idx / g.w) | 0 };
+}
+function px(cx) {
+  return S.L.bx + (cx + 0.5) * S.L.cs;
+}
+function py(cy) {
+  return S.L.by + (cy + 0.5) * S.L.cs;
+}
+function cellCenter(idx) {
+  const c = cellXY(idx);
+  return { x: px(c.x), y: py(c.y) };
+}
+
+// —— 开一关 ——
+function startLevel() {
+  S.levelNo = save.level;
+  S.def = LEVELS[S.levelNo % LEVELS.length];
+  S.g = core.newGame(S.def);
+  S.L = layout(S.g);
+  S.V = new Map();
+  S.dying = [];
+  S.parts = [];
+  S.fx = [];
+  S.texts = [];
+  S.paperVis = new Uint8Array(S.g.paper);
+  S.sel = -1;
+  S.drag = null;
+  S.hint = null;
+  S.idleT = 0;
+  S.endT = 0;
+  S.reward = 0;
+  S.adsUsed = 0;
+  S.inFinale = false;
+  S.result = null;
+  S.flash = 0;
+  S.shake = 0;
+  const g = S.g;
+  // 开场：整盘从上面掉下来（每列错开一点）
+  for (let i = 0; i < g.cells.length; i++) {
+    const p = g.cells[i];
+    if (!p) continue;
+    const c = cellXY(i);
+    S.V.set(p.id, { id: p.id, c: p.c, sp: p.sp, x: c.x, y: c.y - g.h - 0.6 - c.x * 0.35 - (g.h - c.y) * 0.08, ty: c.y, vy: 0, mode: 'fall', land: 0, flash: 0 });
+  }
+  buildTextures();
+  setPhase('intro');
+}
+
+function setPhase(p) {
+  S.phase = p;
+  S.phaseT = 0;
+}
+
+// 蓝图纸 / 插画 / 棋盘框：每关画一次，存在离屏画布里
+function buildTextures() {
+  const L = S.L;
+  const g = S.g;
+  const cs = L.cs;
+  // 插画（正方形，铺满棋盘、居中裁）
+  const s0 = Math.max(L.bw, L.bh);
+  const ic = P.offscreen(s0 * DPR, s0 * DPR);
+  const ix = ic.getContext('2d');
+  ix.scale(DPR, DPR);
+  ART.draw(ix, S.levelNo % LEVELS.length, s0);
+  S.illus = { c: ic, s: s0, ox: (s0 - L.bw) / 2, oy: (s0 - L.bh) / 2 };
+  // 蓝图纸
+  const pc = P.offscreen(L.bw * DPR, L.bh * DPR);
+  const p = pc.getContext('2d');
+  p.scale(DPR, DPR);
+  const grd = p.createLinearGradient(0, 0, 0, L.bh);
+  grd.addColorStop(0, '#2f67a0');
+  grd.addColorStop(1, '#24507f');
+  p.fillStyle = grd;
+  p.fillRect(0, 0, L.bw, L.bh);
+  p.strokeStyle = 'rgba(140,190,240,0.18)';
+  p.lineWidth = 1;
+  for (let k = 0; k <= g.w * 4; k++) {
+    p.beginPath();
+    p.moveTo((k * cs) / 4, 0);
+    p.lineTo((k * cs) / 4, L.bh);
+    p.stroke();
+  }
+  for (let k = 0; k <= g.h * 4; k++) {
+    p.beginPath();
+    p.moveTo(0, (k * cs) / 4);
+    p.lineTo(L.bw, (k * cs) / 4);
+    p.stroke();
+  }
+  // 机关图样（齿轮、圆、尺寸线）
+  p.strokeStyle = 'rgba(225,240,255,0.32)';
+  p.lineWidth = 1.4;
+  const rnd = core.makeRng(31 + S.levelNo);
+  for (let k = 0; k < 5; k++) {
+    const cx = rnd() * L.bw;
+    const cy = rnd() * L.bh;
+    const r = cs * (0.8 + rnd() * 1.6);
+    bpGear(p, cx, cy, r, 10 + ((rnd() * 6) | 0), rnd());
+    p.beginPath();
+    p.arc(cx, cy, r * 0.35, 0, Math.PI * 2);
+    p.stroke();
+  }
+  p.setLineDash([4, 4]);
+  for (let k = 0; k < 4; k++) {
+    const y = rnd() * L.bh;
+    p.beginPath();
+    p.moveTo(0, y);
+    p.lineTo(L.bw, y + (rnd() - 0.5) * cs * 2);
+    p.stroke();
+  }
+  p.setLineDash([]);
+  // 每格一张小纸：亮边 + 暗边
+  for (let i = 0; i < g.cells.length; i++) {
+    if (!g.mask[i]) continue;
+    const c = cellXY(i);
+    const x = c.x * cs;
+    const y = c.y * cs;
+    p.fillStyle = (c.x + c.y) % 2 ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.06)';
+    p.fillRect(x, y, cs, cs);
+    p.fillStyle = 'rgba(190,225,255,0.35)';
+    p.fillRect(x + 1, y + 1, cs - 2, 1.5);
+    p.fillRect(x + 1, y + 1, 1.5, cs - 2);
+    p.fillStyle = 'rgba(10,30,60,0.45)';
+    p.fillRect(x + 1, y + cs - 2, cs - 2, 1.5);
+    p.fillRect(x + cs - 2, y + 1, 1.5, cs - 2);
+  }
+  S.paperTex = pc;
+  // 棋盘框（跟着格子形状走：缺角、空洞都描出来）
+  const pad = 9;
+  const fc = P.offscreen((L.bw + pad * 2) * DPR, (L.bh + pad * 2) * DPR);
+  const f = fc.getContext('2d');
+  f.scale(DPR, DPR);
+  const each = (grow, r, style) => {
+    f.fillStyle = style;
+    for (let i = 0; i < g.cells.length; i++) {
+      if (!g.mask[i]) continue;
+      const c = cellXY(i);
+      rrOn(f, pad + c.x * cs - grow, pad + c.y * cs - grow, cs + grow * 2, cs + grow * 2, r);
+      f.fill();
+    }
+  };
+  each(8, 12, INK);
+  const bg = f.createLinearGradient(0, 0, 0, L.bh + pad * 2);
+  bg.addColorStop(0, BRASS_L);
+  bg.addColorStop(0.5, BRASS);
+  bg.addColorStop(1, BRASS_D);
+  each(6, 10, bg);
+  each(2.5, 5, INK);
+  each(1, 3, '#160f14');
+  S.frameTex = { c: fc, pad };
+}
+
+// 蓝图上的齿轮：只描白线
+function bpGear(p, cx, cy, r, teeth, rot) {
+  p.beginPath();
+  for (let i = 0; i < teeth * 2; i++) {
+    const a = rot + (i / (teeth * 2)) * Math.PI * 2;
+    const rr2 = i % 2 === 0 ? r : r * 0.82;
+    const a2 = a + Math.PI / teeth;
+    p.lineTo(cx + Math.cos(a) * rr2, cy + Math.sin(a) * rr2);
+    p.lineTo(cx + Math.cos(a2) * rr2, cy + Math.sin(a2) * rr2);
+  }
+  p.closePath();
+  p.stroke();
+}
+
+// —— 交换 ——
+function adjacent(a, b) {
+  const A = cellXY(a);
+  const B = cellXY(b);
+  return Math.abs(A.x - B.x) + Math.abs(A.y - B.y) === 1;
+}
+
+function requestSwap(a, b) {
+  const g = S.g;
+  if (S.phase !== 'idle' || g.status !== 'play') return;
+  if (!g.cells[a] || !g.cells[b] || !adjacent(a, b)) return;
+  const pa = g.cells[a];
+  const pb = g.cells[b];
+  const va = S.V.get(pa.id);
+  const vb = S.V.get(pb.id);
+  S.sel = -1;
+  S.hint = null;
+  S.idleT = 0;
+  const r = core.trySwap(g, a, b);
+  if (!r) return;
+  const A = cellXY(a);
+  const B = cellXY(b);
+  P.sound('swap', 0.5);
+  if (!r.ok) {
+    // 弹回去：先过去一半多，再「咚」地回来
+    moveV(va, A, { x: A.x + (B.x - A.x) * 0.55, y: A.y + (B.y - A.y) * 0.55 }, 0.09);
+    moveV(vb, B, { x: B.x + (A.x - B.x) * 0.55, y: B.y + (A.y - B.y) * 0.55 }, 0.09);
+    S.swap = { va, vb, A, B, back: false };
+    setPhase('back');
+    return;
+  }
+  S.stats.swaps++;
+  if (!save.tut) {
+    save.tut = true;
+    persist();
+  }
+  moveV(va, A, B, 0.13);
+  moveV(vb, B, A, 0.13);
+  S.result = r;
+  setPhase('swap');
+}
+
+function moveV(v, from, to, dur, arc) {
+  if (!v) return;
+  v.mode = 'move';
+  v.fx0 = from.x;
+  v.fy0 = from.y;
+  v.fx1 = to.x;
+  v.fy1 = to.y;
+  v.mt = 0;
+  v.md = dur;
+  v.arc = arc || 0;
+}
+
+// —— 播连锁的每一步 ——
+function startSteps(steps) {
+  S.result.steps = steps;
+  S.stepI = 0;
+  setPhase('steps');
+  if (steps.length) startStep(steps[0]);
+  else endSteps();
+}
+
+function startStep(step) {
+  S.step = step;
+  S.stepT = 0;
+  S.stepState = 'pop';
+  S.popSnd = 0;
+  const ev = [];
+  const popAt = new Map();
+  const upAt = new Map();
+  for (const p of step.pops) {
+    ev.push({ t: p.delay, k: 'pop', p });
+    popAt.set(p.idx, p.delay);
+  }
+  for (const u of step.upgrades) {
+    ev.push({ t: u.delay, k: 'up', u });
+    if (!upAt.has(u.idx)) upAt.set(u.idx, u.delay);
+  }
+  for (const f of step.fx) ev.push({ t: f.t, k: 'fx', f });
+  for (const idx of step.torn) ev.push({ t: popAt.has(idx) ? popAt.get(idx) : upAt.has(idx) ? upAt.get(idx) : 0, k: 'tear', idx });
+  ev.sort((a, b) => a.t - b.t);
+  // 连锁越深，节奏越快（不然十几级连锁要等太久）
+  const chain0 = S.inFinale ? 1 : step.chain;
+  S.stepK = Math.max(0.55, 1 - 0.08 * (chain0 - 1));
+  for (const e of ev) e.t *= S.stepK;
+  S.ev = ev;
+  S.evI = 0;
+  S.stepEnd = (ev.length ? ev[ev.length - 1].t : 0) + 0.1;
+  const chain = S.inFinale ? 1 : step.chain;
+  S.stats.maxChain = Math.max(S.stats.maxChain, chain);
+  // 爽感分级：连锁越高，顿帧越长、震得越大、音越高
+  if (step.pops.length) {
+    S.hitstop = Math.max(S.hitstop, Math.min(0.11, 0.02 + 0.016 * (chain - 1)));
+    S.shake = Math.max(S.shake, Math.min(10, 1.5 + chain * 1.3));
+  }
+  if (chain >= 2) {
+    S.texts.push({ str: '连锁 ×' + chain, t: 0, dur: 0.95, size: Math.min(62, 38 + chain * 4), chain });
+    if (chain >= 3) S.cheer = 1.2;
+    if (chain >= 4) P.vibrate(false);
+  }
+  if (step.made.length) {
+    P.sound('make', 0.55);
+  }
+}
+
+function runEvents() {
+  while (S.evI < S.ev.length && S.ev[S.evI].t <= S.stepT) {
+    const e = S.ev[S.evI++];
+    if (e.k === 'pop') doPop(e.p);
+    else if (e.k === 'up') doUpgrade(e.u);
+    else if (e.k === 'fx') doFx(e.f);
+    else if (e.k === 'tear') doTear(e.idx);
+  }
+}
+
+function chainLevel() {
+  return S.inFinale ? 3 : S.step ? S.step.chain : 1;
+}
+
+function doPop(p) {
+  const v = S.V.get(p.id);
+  const c = cellXY(p.idx);
+  const x = px(c.x);
+  const y = py(c.y);
+  if (v) {
+    S.V.delete(p.id);
+    S.dying.push({ c: v.c, sp: v.sp, x: v.x, y: v.y, t: 0, dur: 0.2 });
+  }
+  const col = p.c >= 0 ? PAL[p.c] : { base: BRASS, light: BRASS_L, dark: BRASS_D };
+  const big = p.by !== 'match';
+  burst(x, y, col, big ? 5 : 7, big ? 1.1 : 1);
+  if (Math.random() < 0.5) steam(x, y, 1);
+  if (Math.random() < 0.35) star(x, y, 1);
+  // 消除声：同一步里一串往上升，最多每 0.05 秒一声
+  if (S.time - S.popSndT > 0.05) {
+    const base = (chainLevel() - 1) * 2;
+    P.sound('pop' + Math.min(11, base + Math.min(3, S.popSnd)), 0.55);
+    S.popSnd++;
+    S.popSndT = S.time;
+  }
+}
+
+function doUpgrade(u) {
+  const v = S.V.get(u.id);
+  if (!v) return;
+  v.sp = u.sp;
+  v.c = u.c;
+  v.flash = 1;
+  const c = cellXY(u.idx);
+  ring(px(c.x), py(c.y), S.L.cs * 0.3, S.L.cs * 1.1, '#fff6d0', 0.35, 4);
+  star(px(c.x), py(c.y), 4);
+  if (u.delay > 0 && S.time - S.popSndT > 0.04) {
+    P.sound('tick', 0.4);
+    S.popSndT = S.time;
+  }
+}
+
+function doTear(idx) {
+  if (!S.paperVis[idx]) return;
+  S.paperVis[idx] = 0;
+  const c = cellXY(idx);
+  const cs = S.L.cs;
+  // 一张纸翻着飞走 + 碎纸屑
+  S.parts.push({ k: 'paper', x: px(c.x), y: py(c.y), vx: (Math.random() - 0.5) * 120, vy: -140 - Math.random() * 80, rot: 0, vr: (Math.random() - 0.5) * 10, life: 0.55, max: 0.55, size: cs * 0.72, sx: c.x * cs + cs * 0.14, sy: c.y * cs + cs * 0.14 });
+  for (let k = 0; k < 3; k++) S.parts.push({ k: 'cube', x: px(c.x), y: py(c.y), vx: (Math.random() - 0.5) * 240, vy: -Math.random() * 220, life: 0.5, max: 0.5, size: 3 + Math.random() * 3, color: '#cfe4ff', rot: 0, vr: 6 });
+  S.fx.push({ k: 'glint', idx, t: 0, dur: 0.35 });
+  if (S.time - S.tearSndT > 0.07) {
+    P.sound('tear', 0.45);
+    S.tearSndT = S.time;
+  }
+}
+
+function fxOrigin(idx) {
+  if (idx < 0) return { x: S.L.launch.x, y: S.L.launch.y };
+  return cellCenter(idx);
+}
+
+function doFx(f) {
+  const o = fxOrigin(f.idx);
+  const cs = S.L.cs;
+  S.stats.fx++;
+  if (f.type === 'h' || f.type === 'v' || f.type === 'cross' || f.type === 'cross3') {
+    const wide = f.type === 'cross3';
+    const dirs = f.type === 'h' ? ['h'] : f.type === 'v' ? ['v'] : ['h', 'v'];
+    for (const d of dirs) {
+      const offs = wide ? [-1, 0, 1] : [0];
+      for (const k of offs) S.fx.push({ k: 'beam', dir: d, x: o.x + (d === 'v' ? k * cs : 0), y: o.y + (d === 'h' ? k * cs : 0), t: 0, dur: 0.5 });
+    }
+    P.sound('line', 0.6);
+    S.shake = Math.max(S.shake, wide || f.type === 'cross' ? 10 : 5);
+    S.hitstop = Math.max(S.hitstop, f.type === 'h' || f.type === 'v' ? 0.04 : 0.1);
+    if (f.type !== 'h' && f.type !== 'v') comboBoom(o);
+    S.cheer = 1.2;
+  } else if (f.type === 'bomb') {
+    const big = f.r >= 2;
+    S.fx.push({ k: 'gear', x: o.x, y: o.y, t: 0, dur: 0.55, r: cs * (f.r + 0.6) });
+    ring(o.x, o.y, cs * 0.3, cs * (f.r + 1), '#ffd27a', 0.4, 8);
+    ring(o.x, o.y, cs * 0.2, cs * (f.r + 0.5), '#fff', 0.25, 4);
+    burst(o.x, o.y, { base: BRASS, light: BRASS_L, dark: BRASS_D }, big ? 26 : 14, big ? 2.2 : 1.5);
+    steam(o.x, o.y, big ? 8 : 4);
+    P.sound('bomb', 0.7);
+    S.shake = Math.max(S.shake, big ? 14 : 8);
+    S.hitstop = Math.max(S.hitstop, big ? 0.12 : 0.06);
+    S.flash = Math.max(S.flash, big ? 0.5 : 0.18);
+    if (big) comboBoom(o);
+    P.vibrate(big);
+    S.cheer = 1.2;
+  } else if (f.type === 'bird' || f.type === 'birdfx') {
+    const ts = f.targets || [];
+    ts.forEach((ti, n) => {
+      const to = cellCenter(ti);
+      const arrive = (f.type === 'bird' ? 0.12 + n * 0.035 : 0.1 + n * 0.04) * S.stepK;
+      S.fx.push({ k: 'birdfly', x0: o.x, y0: o.y, x1: to.x, y1: to.y, t: 0, dur: Math.max(0.1, arrive), seed: Math.random() * 6 });
+    });
+    ring(o.x, o.y, cs * 0.4, cs * 2.4, '#fff3c0', 0.5, 6);
+    P.sound('bird', 0.6);
+    S.shake = Math.max(S.shake, 6);
+    S.hitstop = Math.max(S.hitstop, 0.07);
+    S.flash = Math.max(S.flash, 0.2);
+    if (f.type === 'birdfx') {
+      comboBoom(o);
+    }
+    P.vibrate(true);
+    S.cheer = 1.4;
+  } else if (f.type === 'kite') {
+    if (f.to >= 0) {
+      const to = cellCenter(f.to);
+      S.fx.push({ k: 'kite', x0: o.x, y0: o.y, x1: to.x, y1: to.y, t: 0, dur: Math.max(0.1, ((f.land || f.t + 0.4) - f.t) * S.stepK), bonus: f.idx < 0 });
+    }
+    if (f.idx >= 0) ring(o.x, o.y, cs * 0.3, cs * 1.4, '#e8d3a0', 0.3, 5);
+    else S.cheer = Math.max(S.cheer, 0.8);
+    P.sound('kite', 0.5);
+  } else if (f.type === 'all') {
+    comboBoom(o);
+    S.flash = 1;
+    S.shake = 18;
+    S.hitstop = 0.15;
+    ring(o.x, o.y, cs, W, '#fff', 0.8, 12);
+  }
+}
+
+// 组合技：白闪 + 大震 + 专门的轰鸣（第 4 级爽感）
+function comboBoom(o) {
+  P.sound('combo', 0.75);
+  S.flash = Math.max(S.flash, 0.55);
+  S.shake = Math.max(S.shake, 14);
+  S.hitstop = Math.max(S.hitstop, 0.13);
+  ring(o.x, o.y, 10, W * 0.8, '#fff6dc', 0.6, 10);
+  star(o.x, o.y, 10);
+  steam(o.x, o.y, 6);
+  P.vibrate(true);
+}
+
+function applyFalls(step) {
+  for (const m of step.moves) {
+    const v = S.V.get(m.id);
+    if (!v) continue;
+    const c = cellXY(m.to);
+    v.ty = c.y;
+    v.x = c.x;
+    v.mode = 'fall';
+  }
+  for (const s of step.spawns) {
+    const c = cellXY(s.to);
+    S.V.set(s.id, { id: s.id, c: s.c, sp: s.sp, x: c.x, y: s.fromRow, ty: c.y, vy: 2, mode: 'fall', land: 0, flash: 0 });
+  }
+}
+
+function allRest() {
+  for (const v of S.V.values()) if (v.mode !== 'rest') return false;
+  return true;
+}
+
+function endSteps() {
+  if (S.inFinale) {
+    S.inFinale = false;
+    beginWinReveal();
+    return;
+  }
+  const r = S.result;
+  if (r && r.shuffle) {
+    // 没得走了：洗牌
+    for (const m of r.shuffle.moves) {
+      const v = S.V.get(m.id);
+      if (!v) continue;
+      const a = cellXY(m.from);
+      const b = cellXY(m.to);
+      v.c = m.c;
+      moveV(v, a, b, 0.55, 1.2);
+    }
+    r.shuffle = null;
+    S.texts.push({ str: '洗牌', t: 0, dur: 1.0, size: 40, chain: 1 });
+    P.sound('shuffle', 0.6);
+    setPhase('shuffle');
+    return;
+  }
+  afterMove();
+}
+
+function afterMove() {
+  const g = S.g;
+  if (g.status === 'win') startWin();
+  else if (g.status === 'lose') startLose();
+  else {
+    setPhase('idle');
+    S.idleT = 0;
+  }
+}
+
+function startWin() {
+  const step = core.finale(S.g);
+  if (step) {
+    // 收尾：场上剩下的特效块自己全炸一遍
+    S.inFinale = true;
+    S.result = { steps: [step] };
+    startSteps([step]);
+  } else beginWinReveal();
+}
+
+function beginWinReveal() {
+  setPhase('win');
+  S.endT = 0;
+  const g = S.g;
+  // 插画整张亮出来：每块按位置先后飞走
+  for (const v of S.V.values()) v.outT = 0.05 + (v.y / g.h) * 0.25 + Math.random() * 0.1;
+  for (let i = 0; i < S.paperVis.length; i++) if (S.paperVis[i]) doTear(i);
+  S.reward = 20 + g.moves * 2;
+  save.coins += S.reward;
+  save.album[S.levelNo % LEVELS.length] = true;
+  save.level++;
+  persist();
+  P.sound('win', 0.7);
+}
+
+function startLose() {
+  setPhase('lose');
+  S.endT = 0;
+  S.reward = 5;
+  save.coins += S.reward;
+  persist();
+  S.stats.loseWall = Date.now();
+  P.sound('lose', 0.6);
+}
+
+// —— 每帧更新（固定步长） ——
+function update(dt) {
+  S.time += dt;
+  if (S.ad) {
+    const before = Math.ceil(S.ad.t);
+    S.ad.t -= dt;
+    if (Math.ceil(S.ad.t) !== before && S.ad.t > 0) P.sound('tick', 0.4);
+    if (S.ad.t <= 0) {
+      const cb = S.ad.cb;
+      S.ad = null;
+      cb();
+    }
+    return;
+  }
+  S.shake *= Math.pow(0.0005, dt);
+  if (S.shake < 0.3) S.shake = 0;
+  S.flash = Math.max(0, S.flash - dt * 2.2);
+  S.cheer = Math.max(0, S.cheer - dt);
+  for (let i = S.texts.length - 1; i >= 0; i--) {
+    S.texts[i].t += dt;
+    if (S.texts[i].t > S.texts[i].dur) S.texts.splice(i, 1);
+  }
+  if (S.hitstop > 0) {
+    // 顿帧：除了震屏，全停
+    S.hitstop -= dt;
+    return;
+  }
+  updatePieces(dt);
+  updateParts(dt);
+  S.phaseT += dt;
+  const g = S.g;
+  switch (S.phase) {
+    case 'intro':
+      if (allRest()) {
+        setPhase('idle');
+        S.stats.readyWall = Date.now();
+      }
+      break;
+    case 'idle':
+      S.idleT += dt;
+      if (S.idleT > 3 && !S.hint) S.hint = core.bestMove(g);
+      break;
+    case 'back':
+      if (!S.swap.back && allRest()) {
+        S.swap.back = true;
+        const sw = S.swap;
+        moveV(sw.va, { x: sw.va.x, y: sw.va.y }, sw.A, 0.14);
+        moveV(sw.vb, { x: sw.vb.x, y: sw.vb.y }, sw.B, 0.14);
+        P.sound('bonk', 0.8);
+        S.shake = Math.max(S.shake, 2.5);
+        P.vibrate(false);
+      } else if (S.swap.back && allRest()) {
+        setPhase('idle');
+      }
+      break;
+    case 'swap':
+      if (allRest()) startSteps(S.result.steps);
+      break;
+    case 'steps':
+      if (S.stepState === 'pop') {
+        S.stepT += dt;
+        runEvents();
+        if (S.evI >= S.ev.length && S.stepT >= S.stepEnd) {
+          applyFalls(S.step);
+          S.stepState = 'fall';
+        }
+      } else if (allRest()) {
+        S.stepI++;
+        if (S.stepI < S.result.steps.length) startStep(S.result.steps[S.stepI]);
+        else endSteps();
+      }
+      break;
+    case 'shuffle':
+      if (allRest()) afterMove();
+      break;
+    case 'win':
+      S.endT += dt;
+      for (const [id, v] of S.V) {
+        if (S.endT >= v.outT) {
+          S.V.delete(id);
+          S.dying.push({ c: v.c, sp: v.sp, x: v.x, y: v.y, t: 0, dur: 0.3 });
+          if (Math.random() < 0.4) star(px(v.x), py(v.y), 1);
+        }
+      }
+      if (S.endT >= 0.55 && S.endT - dt < 0.55) {
+        S.flash = 1;
+        P.sound('reveal', 0.8);
+        S.cheer = 2.5;
+        const L = S.L;
+        for (let k = 0; k < 24; k++) star(L.bx + Math.random() * L.bw, L.by + Math.random() * L.bh, 1);
+      }
+      if (S.endT >= 1.3 && S.endT - dt < 1.3) P.sound('coin', 0.5);
+      break;
+    case 'lose':
+      S.endT += dt;
+      break;
+  }
+}
+
+function updatePieces(dt) {
+  for (const v of S.V.values()) {
+    if (v.flash > 0) v.flash = Math.max(0, v.flash - dt * 3);
+    if (v.land > 0) {
+      v.land += dt;
+      if (v.land > 0.25) v.land = 0;
+    }
+    if (v.mode === 'fall') {
+      v.vy = Math.min(VMAX, v.vy + GRAV * dt);
+      v.y += v.vy * dt;
+      if (v.y >= v.ty) {
+        v.y = v.ty;
+        v.land = v.vy > 4 ? 0.001 : 0;
+        v.landK = Math.min(1, v.vy / 14);
+        v.vy = 0;
+        v.mode = 'rest';
+      }
+    } else if (v.mode === 'move') {
+      v.mt += dt;
+      const p = Math.min(1, v.mt / v.md);
+      const e = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+      v.x = v.fx0 + (v.fx1 - v.fx0) * e;
+      v.y = v.fy0 + (v.fy1 - v.fy0) * e - Math.sin(p * Math.PI) * v.arc;
+      if (p >= 1) {
+        v.x = v.fx1;
+        v.y = v.fy1;
+        v.mode = 'rest';
+      }
+    }
+  }
+  for (let i = S.dying.length - 1; i >= 0; i--) {
+    S.dying[i].t += dt;
+    if (S.dying[i].t >= S.dying[i].dur) S.dying.splice(i, 1);
+  }
+}
+
+function updateParts(dt) {
+  for (let i = S.parts.length - 1; i >= 0; i--) {
+    const p = S.parts[i];
+    p.life -= dt;
+    if (p.life <= 0) {
+      S.parts.splice(i, 1);
+      continue;
+    }
+    if (p.k === 'steam') {
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy -= 20 * dt;
+      p.size += 30 * dt;
+    } else if (p.k === 'star' || p.k === 'ring') {
+      p.x += (p.vx || 0) * dt;
+      p.y += (p.vy || 0) * dt;
+      if (p.vx) p.vx *= Math.pow(0.05, dt);
+      if (p.vy) p.vy *= Math.pow(0.05, dt);
+    } else {
+      p.vy += 900 * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.rot += (p.vr || 0) * dt;
+    }
+  }
+  for (let i = S.fx.length - 1; i >= 0; i--) {
+    const f = S.fx[i];
+    f.t += dt;
+    if (f.k === 'kite' && Math.random() < 0.5) {
+      const p = kitePos(f);
+      S.parts.push({ k: 'steam', x: p.x, y: p.y, vx: 0, vy: 0, life: 0.35, max: 0.35, size: 3 });
+    }
+    if (f.t >= f.dur) {
+      if (f.k === 'kite' || f.k === 'birdfly') {
+        burst(f.x1, f.y1, { base: BRASS, light: BRASS_L, dark: BRASS_D }, 4, 0.8);
+        star(f.x1, f.y1, 1);
+      }
+      S.fx.splice(i, 1);
+    }
+  }
+  if (S.parts.length > 500) S.parts.splice(0, S.parts.length - 500);
+}
+
+// —— 粒子 ——
+function burst(x, y, col, n, power) {
+  for (let k = 0; k < n; k++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = (120 + Math.random() * 260) * power;
+    const pick = Math.random();
+    S.parts.push({ k: 'cube', x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 160, life: 0.45 + Math.random() * 0.35, max: 0.8, size: 4 + Math.random() * 5, color: pick < 0.5 ? col.base : pick < 0.8 ? col.light : col.dark, rot: Math.random() * 6, vr: (Math.random() - 0.5) * 16 });
+  }
+}
+function steam(x, y, n) {
+  for (let k = 0; k < n; k++) S.parts.push({ k: 'steam', x: x + (Math.random() - 0.5) * 16, y: y + (Math.random() - 0.5) * 10, vx: (Math.random() - 0.5) * 40, vy: -30 - Math.random() * 40, life: 0.6, max: 0.6, size: 6 + Math.random() * 6 });
+}
+function star(x, y, n) {
+  for (let k = 0; k < n; k++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = n > 1 ? 120 + Math.random() * 200 : 30 + Math.random() * 60;
+    S.parts.push({ k: 'star', x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0.5 + Math.random() * 0.3, max: 0.8, size: 5 + Math.random() * 6 });
+  }
+}
+function ring(x, y, r0, r1, color, dur, lw) {
+  S.parts.push({ k: 'ring', x, y, r0, r1, color, life: dur, max: dur, lw });
+}
+
+// —— 画：基础 ——
+function rrOn(c, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.arcTo(x + w, y, x + w, y + h, r);
+  c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r);
+  c.arcTo(x, y, x + w, y, r);
+  c.closePath();
+}
+function rr(x, y, w, h, r) {
+  rrOn(ctx, x, y, w, h, r);
+}
+function circle(x, y, r) {
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+}
+function text(str, x, y, size, color, align, stroke, weight) {
+  ctx.font = `${weight || 'bold'} ${size}px ${FONT}`;
+  ctx.textAlign = align || 'center';
+  ctx.textBaseline = 'middle';
+  if (stroke) {
+    ctx.lineWidth = Math.max(3, size / 4.5);
+    ctx.strokeStyle = stroke;
+    ctx.lineJoin = 'round';
+    ctx.strokeText(str, x, y);
+  }
+  ctx.fillStyle = color;
+  ctx.fillText(str, x, y);
+}
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+function easeOut(t) {
+  t = Math.max(0, Math.min(1, t));
+  return 1 - Math.pow(1 - t, 3);
+}
+function backOut(t) {
+  t = Math.max(0, Math.min(1, t));
+  const c = 1.7;
+  return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2);
+}
+
+// —— 画：六种块（缓存成小图，每帧只贴） ——
+function shapePath(c, k, r) {
+  c.beginPath();
+  if (k === 0) {
+    // 铜铃：圆顶 + 外撇的裙边 + 顶上的提钮
+    c.moveTo(-r * 0.95, r * 0.6);
+    c.quadraticCurveTo(-r * 0.74, r * 0.42, -r * 0.7, r * 0.02);
+    c.bezierCurveTo(-r * 0.7, -r * 0.8, r * 0.7, -r * 0.8, r * 0.7, r * 0.02);
+    c.quadraticCurveTo(r * 0.74, r * 0.42, r * 0.95, r * 0.6);
+    c.quadraticCurveTo(0, r * 0.86, -r * 0.95, r * 0.6);
+    c.closePath();
+    c.moveTo(r * 0.22, -r * 0.72);
+    c.arc(0, -r * 0.72, r * 0.22, 0, Math.PI * 2);
+  } else if (k === 1) {
+    // 齿轮：8 个齿
+    const n = 8;
+    for (let i = 0; i < n; i++) {
+      const a0 = (i / n) * Math.PI * 2 - Math.PI / 2;
+      const w = (Math.PI * 2) / n;
+      const pts = [
+        [a0 - w * 0.5, 0.74],
+        [a0 - w * 0.22, 0.74],
+        [a0 - w * 0.16, 0.97],
+        [a0 + w * 0.16, 0.97],
+        [a0 + w * 0.22, 0.74],
+      ];
+      for (const [a, rr2] of pts) {
+        const x = Math.cos(a) * r * rr2;
+        const y = Math.sin(a) * r * rr2;
+        if (i === 0 && a === pts[0][0]) c.moveTo(x, y);
+        else c.lineTo(x, y);
+      }
+    }
+    c.closePath();
+  } else if (k === 2) {
+    // 灯笼：椭圆灯身 + 上下铜盖
+    c.ellipse(0, r * 0.02, r * 0.82, r * 0.68, 0, 0, Math.PI * 2);
+    c.moveTo(-r * 0.42, -r * 0.62);
+    c.rect(-r * 0.42, -r * 0.9, r * 0.84, r * 0.3);
+    c.moveTo(-r * 0.42, r * 0.62);
+    c.rect(-r * 0.42, r * 0.6, r * 0.84, r * 0.3);
+  } else if (k === 3) {
+    // 竹简：竖着的一卷
+    rrOn(c, -r * 0.74, -r * 0.88, r * 1.48, r * 1.76, r * 0.26);
+  } else if (k === 4) {
+    // 水银滴
+    c.moveTo(0, -r * 0.98);
+    c.bezierCurveTo(r * 0.25, -r * 0.6, r * 0.78, -r * 0.22, r * 0.78, r * 0.2);
+    c.arc(0, r * 0.2, r * 0.78, 0, Math.PI, false);
+    c.bezierCurveTo(-r * 0.78, -r * 0.22, -r * 0.25, -r * 0.6, 0, -r * 0.98);
+    c.closePath();
+  } else {
+    // 螺母：六角
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2;
+      const x = Math.cos(a) * r * 0.95;
+      const y = Math.sin(a) * r * 0.95;
+      if (i === 0) c.moveTo(x, y);
+      else c.lineTo(x, y);
+    }
+    c.closePath();
+  }
+}
+
+function drawPieceBase(c, k, r) {
+  const col = PAL[k];
+  const lw = Math.max(1.6, r * 0.085);
+  // 一档硬阴影（落在棋盘上）
+  c.save();
+  c.translate(0, r * 0.13);
+  shapePath(c, k, r);
+  c.fillStyle = 'rgba(10,4,14,0.5)';
+  c.fill();
+  c.restore();
+  // 赛璐璐：整块暗色，再往左上错一点铺亮色，右下留一道暗边
+  c.save();
+  shapePath(c, k, r);
+  c.clip();
+  c.fillStyle = col.dark;
+  c.fillRect(-r * 1.2, -r * 1.2, r * 2.4, r * 2.4);
+  c.translate(-r * 0.07, -r * 0.1);
+  shapePath(c, k, r);
+  c.fillStyle = col.base;
+  c.fill();
+  c.restore();
+  // 细节
+  c.save();
+  shapePath(c, k, r);
+  c.clip();
+  c.lineCap = 'round';
+  if (k === 0) {
+    c.fillStyle = col.light;
+    c.fillRect(-r, r * 0.3, r * 2, r * 0.1);
+    c.fillStyle = BRASS_D;
+    c.beginPath();
+    c.arc(0, r * 0.74, r * 0.17, 0, Math.PI * 2);
+    c.fill();
+  } else if (k === 1) {
+    c.fillStyle = col.dark;
+    c.beginPath();
+    c.arc(0, 0, r * 0.32, 0, Math.PI * 2);
+    c.fill();
+    c.strokeStyle = col.light;
+    c.lineWidth = r * 0.08;
+    c.beginPath();
+    c.arc(0, 0, r * 0.52, Math.PI * 1.05, Math.PI * 1.6);
+    c.stroke();
+  } else if (k === 2) {
+    c.strokeStyle = col.dark;
+    c.lineWidth = r * 0.07;
+    for (const ex of [0.35, 0.68]) {
+      c.beginPath();
+      c.ellipse(0, r * 0.02, r * 0.82 * ex, r * 0.66, 0, 0, Math.PI * 2);
+      c.stroke();
+    }
+    c.fillStyle = BRASS;
+    c.fillRect(-r * 0.42, -r * 0.9, r * 0.84, r * 0.3);
+    c.fillRect(-r * 0.42, r * 0.6, r * 0.84, r * 0.3);
+    c.fillStyle = BRASS_L;
+    c.fillRect(-r * 0.42, -r * 0.9, r * 0.84, r * 0.08);
+  } else if (k === 3) {
+    c.strokeStyle = col.dark;
+    c.lineWidth = r * 0.08;
+    for (const gx of [-0.25, 0.25]) {
+      c.beginPath();
+      c.moveTo(gx * r, -r);
+      c.lineTo(gx * r, r);
+      c.stroke();
+    }
+    c.fillStyle = '#8a5a2b';
+    c.fillRect(-r, -r * 0.5, r * 2, r * 0.14);
+    c.fillRect(-r, r * 0.38, r * 2, r * 0.14);
+  } else if (k === 4) {
+    c.fillStyle = col.light;
+    c.globalAlpha = 0.6;
+    c.beginPath();
+    c.arc(r * 0.18, r * 0.38, r * 0.26, 0, Math.PI * 2);
+    c.fill();
+    c.globalAlpha = 1;
+  } else {
+    c.strokeStyle = col.light;
+    c.lineWidth = r * 0.07;
+    c.beginPath();
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2;
+      const x = Math.cos(a) * r * 0.66;
+      const y = Math.sin(a) * r * 0.66;
+      if (i === 0) c.moveTo(x, y);
+      else c.lineTo(x, y);
+    }
+    c.closePath();
+    c.stroke();
+    c.fillStyle = col.dark;
+    c.beginPath();
+    c.arc(0, 0, r * 0.32, 0, Math.PI * 2);
+    c.fill();
+    c.fillStyle = 'rgba(0,0,0,0.35)';
+    c.beginPath();
+    c.arc(r * 0.05, r * 0.06, r * 0.22, 0, Math.PI * 2);
+    c.fill();
+  }
+  // 高光
+  c.fillStyle = 'rgba(255,255,255,0.75)';
+  c.beginPath();
+  c.ellipse(-r * 0.32, -r * 0.36, r * 0.26, r * 0.13, -0.6, 0, Math.PI * 2);
+  c.fill();
+  c.beginPath();
+  c.arc(-r * 0.02, -r * 0.5, r * 0.06, 0, Math.PI * 2);
+  c.fill();
+  c.restore();
+  // 深色描边
+  shapePath(c, k, r);
+  c.lineWidth = lw;
+  c.strokeStyle = INK;
+  c.lineJoin = 'round';
+  c.stroke();
+}
+
+const spriteCache = {};
+function pieceSprite(k, size) {
+  const key = k + '_' + size;
+  if (!spriteCache[key]) {
+    const box = Math.ceil(size * 1.3);
+    const c = P.offscreen(box * DPR, box * DPR);
+    const x = c.getContext('2d');
+    x.scale(DPR, DPR);
+    x.translate(box / 2, box / 2);
+    drawPieceBase(x, k, size * 0.42);
+    spriteCache[key] = { c, box };
+  }
+  return spriteCache[key];
+}
+
+// 画一块（含特效块的动画部分）。cx, cy = 屏幕中心；s = 缩放
+function drawPiece(k, sp, cx, cy, s, sx, sy, alpha, rot) {
+  const cs = S.L.cs;
+  const r = cs * 0.42;
+  ctx.save();
+  ctx.translate(cx, cy);
+  if (rot) ctx.rotate(rot);
+  ctx.scale(s * (sx || 1), s * (sy || 1));
+  if (alpha !== undefined) ctx.globalAlpha = alpha;
+  const t = S.time;
+  if (sp === SP.BIRD) {
+    drawBird(r, t);
+  } else {
+    if (sp === SP.BOMB) {
+      // 齿轮炸弹：后面一个慢慢转的黄铜大齿轮
+      ART.gear(ctx, 0, 0, r * 1.12, 10, BRASS, t * 1.5, Math.max(1.5, r * 0.08));
+      ctx.fillStyle = BRASS_D;
+      circle(0, 0, r * 0.82);
+      ctx.fill();
+    }
+    if (sp === SP.KITE) drawKiteWings(r, t);
+    const sc = sp === SP.NONE ? 1 : sp === SP.BOMB ? 0.74 : sp === SP.KITE ? 0.8 : 0.86;
+    const spr = pieceSprite(k, cs);
+    const b = spr.box * sc;
+    ctx.drawImage(spr.c, -b / 2, -b / 2, b, b);
+    if (sp === SP.H || sp === SP.V) drawBolt(r, sp === SP.V, t);
+    if (sp === SP.BOMB) {
+      // 引信火星
+      const fl = 0.6 + 0.4 * Math.sin(t * 30);
+      ctx.fillStyle = '#fff3a0';
+      starShape(r * 0.62, -r * 0.7, r * 0.22 * fl);
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+// 连弩：一支两头带箭的黄铜弩箭横（竖）穿过去
+function drawBolt(r, vert, t) {
+  ctx.save();
+  if (vert) ctx.rotate(Math.PI / 2);
+  const L = r * 1.08;
+  const pulse = 1 + 0.06 * Math.sin(t * 8);
+  ctx.scale(pulse, 1);
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = Math.max(1.5, r * 0.08);
+  ctx.strokeStyle = INK;
+  rr(-L * 0.78, -r * 0.13, L * 1.56, r * 0.26, r * 0.1);
+  ctx.fillStyle = BRASS;
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = '#fff6d8';
+  ctx.fillRect(-L * 0.7, -r * 0.08, L * 1.4, r * 0.06);
+  for (const s of [-1, 1]) {
+    ctx.beginPath();
+    ctx.moveTo(s * L * 1.08, 0);
+    ctx.lineTo(s * L * 0.7, -r * 0.3);
+    ctx.lineTo(s * L * 0.7, r * 0.3);
+    ctx.closePath();
+    ctx.fillStyle = BRASS_L;
+    ctx.fill();
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// 木鸢的翅膀：竹骨 + 绢面，一扇一扇
+function drawKiteWings(r, t) {
+  const flap = 0.75 + 0.25 * Math.sin(t * 12);
+  ctx.save();
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = Math.max(1.4, r * 0.07);
+  for (const s of [-1, 1]) {
+    ctx.save();
+    ctx.scale(s, flap);
+    ctx.beginPath();
+    ctx.moveTo(r * 0.2, -r * 0.2);
+    ctx.lineTo(r * 1.18, -r * 0.62);
+    ctx.lineTo(r * 1.0, r * 0.05);
+    ctx.lineTo(r * 0.2, r * 0.3);
+    ctx.closePath();
+    ctx.fillStyle = '#f3dfb0';
+    ctx.fill();
+    ctx.strokeStyle = INK;
+    ctx.stroke();
+    ctx.strokeStyle = '#9a6b3a';
+    ctx.beginPath();
+    ctx.moveTo(r * 0.25, 0);
+    ctx.lineTo(r * 1.12, -r * 0.5);
+    ctx.stroke();
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+// 铜雀：深色圆底 + 一圈六色小灯 + 中间一只黄铜鸟
+function drawBird(r, t) {
+  ctx.fillStyle = 'rgba(10,4,14,0.5)';
+  circle(0, r * 0.12, r * 0.95);
+  ctx.fill();
+  const g = ctx.createRadialGradient(-r * 0.3, -r * 0.3, r * 0.1, 0, 0, r);
+  g.addColorStop(0, '#5a4a8a');
+  g.addColorStop(1, '#241a3a');
+  ctx.fillStyle = g;
+  circle(0, 0, r * 0.95);
+  ctx.fill();
+  ctx.lineWidth = Math.max(1.6, r * 0.085);
+  ctx.strokeStyle = INK;
+  ctx.stroke();
+  for (let i = 0; i < 6; i++) {
+    const a = t * 2 + (i / 6) * Math.PI * 2;
+    ctx.fillStyle = PAL[i].base;
+    circle(Math.cos(a) * r * 0.74, Math.sin(a) * r * 0.74, r * 0.14);
+    ctx.fill();
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+  ART.bird(ctx, -r * 0.05, 0, r * 0.95, Math.sin(t * 4) * 0.1);
+}
+
+function starShape(x, y, r) {
+  ctx.beginPath();
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2 - Math.PI / 2;
+    const rr2 = i % 2 === 0 ? r : r * 0.38;
+    const X = x + Math.cos(a) * rr2;
+    const Y = y + Math.sin(a) * rr2;
+    if (i === 0) ctx.moveTo(X, Y);
+    else ctx.lineTo(X, Y);
+  }
+  ctx.closePath();
+}
+
+// —— 画：场景 ——
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#2a1a24');
+  g.addColorStop(0.5, '#1d1420');
+  g.addColorStop(1, '#140e16');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // 暖色灯光
+  const lg = ctx.createRadialGradient(W * 0.5, S.L ? S.L.by + S.L.bh * 0.4 : H * 0.4, 20, W * 0.5, H * 0.4, W * 0.9);
+  lg.addColorStop(0, 'rgba(255,170,80,0.16)');
+  lg.addColorStop(1, 'rgba(255,170,80,0)');
+  ctx.fillStyle = lg;
+  ctx.fillRect(0, 0, W, H);
+  // 背后的大齿轮（很淡，慢慢转）
+  ctx.globalAlpha = 0.12;
+  ART.gear(ctx, -20, 120, 90, 14, BRASS, S.time * 0.15, 3);
+  ART.gear(ctx, W + 10, 230, 70, 12, BRASS, -S.time * 0.2, 3);
+  ctx.globalAlpha = 1;
+}
+
+function drawHud() {
+  const L = S.L;
+  const g = S.g;
+  const y = L.top + 4;
+  const ph = 64;
+  // 左：剩余步数
+  plaque(12, y, 92, ph);
+  text('步数', 58, y + 15, 12, '#f3dfb0', 'center', null, 'normal');
+  const low = g.moves <= 5 && g.status === 'play';
+  const pulse = low ? 1 + 0.08 * Math.sin(S.time * 10) : 1;
+  ctx.save();
+  ctx.translate(58, y + 41);
+  ctx.scale(pulse, pulse);
+  text(String(g.moves), 0, 0, 32, low ? '#ff8a7a' : '#fff', 'center', INK);
+  ctx.restore();
+  // 右：还剩几格没撕
+  let left = 0;
+  for (let i = 0; i < S.paperVis.length; i++) left += S.paperVis[i];
+  plaque(W - 104, y, 92, ph);
+  // 小蓝图纸图标
+  const ix = W - 104 + 20;
+  const iy = y + 15;
+  ctx.save();
+  ctx.translate(ix + 38, iy);
+  ctx.fillStyle = '#2f67a0';
+  rr(-9, -7, 18, 14, 2);
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = INK;
+  ctx.stroke();
+  ctx.strokeStyle = 'rgba(200,230,255,0.7)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(-5, 0);
+  ctx.lineTo(5, 0);
+  ctx.moveTo(0, -4);
+  ctx.lineTo(0, 4);
+  ctx.stroke();
+  ctx.restore();
+  text(String(left), W - 58, y + 41, 32, left <= 3 ? '#9cf09c' : '#fff', 'center', INK);
+  // 中：第几关 + 撕纸进度
+  const cx = W / 2;
+  text('第 ' + (S.levelNo + 1) + ' 关', cx, y + 16, 15, '#f3dfb0', 'center', INK);
+  const bw = Math.min(140, W - 250);
+  const done = 1 - left / g.paperTotal;
+  rr(cx - bw / 2, y + 34, bw, 14, 7);
+  ctx.fillStyle = '#120c12';
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = INK;
+  ctx.stroke();
+  if (done > 0) {
+    rr(cx - bw / 2 + 2, y + 36, Math.max(10, (bw - 4) * done), 10, 5);
+    const pg = ctx.createLinearGradient(0, y + 36, 0, y + 46);
+    pg.addColorStop(0, BRASS_L);
+    pg.addColorStop(1, BRASS);
+    ctx.fillStyle = pg;
+    ctx.fill();
+  }
+  coinIcon(cx - 16, y + 60, 6);
+  text(String(save.coins), cx - 6, y + 61, 12, '#fff3c4', 'left');
+}
+
+function plaque(x, y, w, h) {
+  rr(x, y + 3, w, h, 14);
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.fill();
+  rr(x, y, w, h, 14);
+  const g = ctx.createLinearGradient(0, y, 0, y + h);
+  g.addColorStop(0, BRASS_L);
+  g.addColorStop(0.5, BRASS);
+  g.addColorStop(1, BRASS_D);
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = INK;
+  ctx.stroke();
+  rr(x + 6, y + 24, w - 12, h - 30, 9);
+  ctx.fillStyle = '#2a1a20';
+  ctx.fill();
+  // 铆钉
+  ctx.fillStyle = BRASS_D;
+  for (const [rx, ry] of [[x + 8, y + 9], [x + w - 8, y + 9]]) {
+    circle(rx, ry, 2.5);
+    ctx.fill();
+  }
+}
+
+function coinIcon(x, y, r) {
+  circle(x, y, r);
+  ctx.fillStyle = '#f5cf4c';
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = INK;
+  ctx.stroke();
+  ctx.fillStyle = '#a8851a';
+  ctx.fillRect(x - r * 0.3, y - r * 0.3, r * 0.6, r * 0.6);
+}
+
+function boardClip() {
+  const g = S.g;
+  const L = S.L;
+  ctx.beginPath();
+  for (let i = 0; i < g.cells.length; i++) {
+    if (!g.mask[i]) continue;
+    const c = cellXY(i);
+    ctx.rect(L.bx + c.x * L.cs - 0.5, L.by + c.y * L.cs - 0.5, L.cs + 1, L.cs + 1);
+  }
+}
+
+function drawBoard() {
+  const g = S.g;
+  const L = S.L;
+  const cs = L.cs;
+  const ft = S.frameTex;
+  ctx.drawImage(ft.c, L.bx - ft.pad, L.by - ft.pad, L.bw + ft.pad * 2, L.bh + ft.pad * 2);
+  const il = S.illus;
+  const k = il.c.width / il.s;
+  const pk = S.paperTex.width / L.bw;
+  const playing = S.phase !== 'win';
+  for (let i = 0; i < g.cells.length; i++) {
+    if (!g.mask[i]) continue;
+    const c = cellXY(i);
+    const x = L.bx + c.x * cs;
+    const y = L.by + c.y * cs;
+    if (S.paperVis[i]) {
+      ctx.drawImage(S.paperTex, c.x * cs * pk, c.y * cs * pk, cs * pk, cs * pk, x, y, cs, cs);
+      // 输了：没撕的纸一闪一闪，让人看见「就差这几格」
+      if (S.phase === 'lose') {
+        rr(x + 3, y + 3, cs - 6, cs - 6, 6);
+        ctx.lineWidth = 2.5;
+        ctx.strokeStyle = 'rgba(255,214,110,' + (0.55 + 0.4 * Math.sin(S.time * 6)) + ')';
+        ctx.stroke();
+      }
+    } else {
+      ctx.drawImage(il.c, (il.ox + c.x * cs) * k, (il.oy + c.y * cs) * k, cs * k, cs * k, x, y, cs, cs);
+      if (playing) {
+        ctx.fillStyle = 'rgba(20,10,20,0.22)';
+        ctx.fillRect(x, y, cs, cs);
+      }
+    }
+  }
+  // 刚撕开的格子亮一下
+  for (const f of S.fx) {
+    if (f.k !== 'glint') continue;
+    const c = cellXY(f.idx);
+    ctx.fillStyle = 'rgba(255,250,220,' + (1 - f.t / f.dur) * 0.7 + ')';
+    ctx.fillRect(L.bx + c.x * cs, L.by + c.y * cs, cs, cs);
+  }
+  // 选中 / 提示
+  if (S.sel >= 0 && S.phase === 'idle') {
+    const c = cellXY(S.sel);
+    rr(L.bx + c.x * cs + 2, L.by + c.y * cs + 2, cs - 4, cs - 4, 8);
+    ctx.fillStyle = 'rgba(255,230,150,0.35)';
+    ctx.fill();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = '#ffe9a8';
+    ctx.stroke();
+  }
+  // 块
+  ctx.save();
+  boardClip();
+  ctx.clip();
+  const hintIds = hintPieceIds();
+  for (const v of S.V.values()) {
+    let sx = 1;
+    let sy = 1;
+    let oy = 0;
+    if (v.land > 0) {
+      // 落地轻弹：先压扁再弹起
+      const t = v.land / 0.25;
+      const a = Math.sin(t * Math.PI * 2) * Math.exp(-t * 3) * 0.16 * (v.landK || 1);
+      sx = 1 + a;
+      sy = 1 - a;
+      oy = (cs * 0.42 * a) / 1;
+    }
+    let rot = 0;
+    let s = 1;
+    if (hintIds && (v.id === hintIds[0] || v.id === hintIds[1])) {
+      const ph = S.time % 1.3;
+      if (ph < 0.5) rot = Math.sin(ph * 40) * 0.13 * (1 - ph / 0.5);
+      s = 1.04;
+    }
+    if (S.sel >= 0 && S.g.cells[S.sel] && S.g.cells[S.sel].id === v.id && S.phase === 'idle') s = 1.1 + 0.03 * Math.sin(S.time * 8);
+    drawPiece(v.c, v.sp, px(v.x), py(v.y) + oy, s, sx, sy, undefined, rot);
+    if (v.flash > 0) {
+      ctx.globalAlpha = v.flash * 0.8;
+      ctx.fillStyle = '#fff';
+      circle(px(v.x), py(v.y), cs * 0.45);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+  ctx.restore();
+  // 正在消失的块：鼓一下再缩没
+  for (const d of S.dying) {
+    const t = d.t / d.dur;
+    const s = t < 0.3 ? 1 + t * 0.8 : 1.24 * (1 - (t - 0.3) / 0.7);
+    drawPiece(d.c, d.sp, px(d.x), py(d.y), Math.max(0.01, s), 1, 1, 1 - t * 0.5);
+    if (t < 0.4) {
+      ctx.globalAlpha = (0.4 - t) * 2;
+      ctx.fillStyle = '#fff';
+      circle(px(d.x), py(d.y), cs * 0.42 * s);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+
+function hintPieceIds() {
+  const g = S.g;
+  let m = null;
+  if (S.phase === 'idle' && S.hint) m = S.hint;
+  if (!m) return null;
+  const a = g.cells[m.a];
+  const b = g.cells[m.b];
+  return a && b ? [a.id, b.id] : null;
+}
+
+function kitePos(f) {
+  const p = Math.min(1, f.t / f.dur);
+  const e = p * p * (3 - 2 * p);
+  return { x: lerp(f.x0, f.x1, e) + Math.sin(p * Math.PI) * 40 * (f.x1 > f.x0 ? -1 : 1), y: lerp(f.y0, f.y1, e) - Math.sin(p * Math.PI) * 50, p };
+}
+
+function drawFx() {
+  const L = S.L;
+  const cs = L.cs;
+  for (const f of S.fx) {
+    const p = f.t / f.dur;
+    if (f.k === 'beam') {
+      // 连弩：弩箭从中间往两头飞，后面留一道光
+      const reach = (f.t / 0.035) * cs;
+      const a = p < 0.6 ? 1 : 1 - (p - 0.6) / 0.4;
+      ctx.save();
+      ctx.globalAlpha = a;
+      const horiz = f.dir === 'h';
+      const x0 = horiz ? Math.max(L.bx - cs, f.x - reach) : f.x;
+      const x1 = horiz ? Math.min(L.bx + L.bw + cs, f.x + reach) : f.x;
+      const y0 = horiz ? f.y : Math.max(L.by - cs, f.y - reach);
+      const y1 = horiz ? f.y : Math.min(L.by + L.bh + cs, f.y + reach);
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = 'rgba(255,200,90,0.5)';
+      ctx.lineWidth = cs * 0.7 * (1 - p * 0.6);
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      ctx.lineTo(x1, y1);
+      ctx.stroke();
+      ctx.strokeStyle = '#fffbe8';
+      ctx.lineWidth = cs * 0.22 * (1 - p * 0.6);
+      ctx.stroke();
+      ctx.restore();
+      // 弩箭头
+      if (p < 0.7) {
+        for (const s of [-1, 1]) {
+          const hx = horiz ? (s < 0 ? x0 : x1) : f.x;
+          const hy = horiz ? f.y : s < 0 ? y0 : y1;
+          ctx.save();
+          ctx.translate(hx, hy);
+          ctx.rotate(horiz ? (s < 0 ? Math.PI : 0) : s < 0 ? -Math.PI / 2 : Math.PI / 2);
+          ctx.beginPath();
+          ctx.moveTo(cs * 0.4, 0);
+          ctx.lineTo(-cs * 0.2, -cs * 0.22);
+          ctx.lineTo(-cs * 0.2, cs * 0.22);
+          ctx.closePath();
+          ctx.fillStyle = BRASS_L;
+          ctx.fill();
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = INK;
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+    } else if (f.k === 'gear') {
+      ctx.save();
+      ctx.globalAlpha = 1 - p;
+      ART.gear(ctx, f.x, f.y, f.r * (0.4 + p * 0.8), 12, 'rgba(255,210,120,0.5)', p * 3, 3);
+      ctx.restore();
+    } else if (f.k === 'kite') {
+      const q = kitePos(f);
+      const ang = Math.atan2(f.y1 - f.y0, f.x1 - f.x0);
+      ctx.save();
+      ctx.translate(q.x, q.y);
+      ctx.rotate(ang + Math.PI / 2 + Math.sin(f.t * 20) * 0.15);
+      const r = cs * 0.5;
+      drawKiteWings(r, S.time);
+      ctx.fillStyle = '#c98a4a';
+      ctx.beginPath();
+      ctx.moveTo(0, -r * 0.9);
+      ctx.lineTo(r * 0.3, 0);
+      ctx.lineTo(0, r * 0.8);
+      ctx.lineTo(-r * 0.3, 0);
+      ctx.closePath();
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = INK;
+      ctx.stroke();
+      ctx.restore();
+    } else if (f.k === 'birdfly') {
+      const e = p * p;
+      const x = lerp(f.x0, f.x1, e) + Math.sin(p * Math.PI) * 30 * Math.sin(f.seed);
+      const y = lerp(f.y0, f.y1, e) - Math.sin(p * Math.PI) * 40;
+      ctx.strokeStyle = 'rgba(255,230,150,0.45)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(f.x0, f.y0);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+      ART.bird(ctx, x, y, cs * 0.45, Math.atan2(f.y1 - f.y0, f.x1 - f.x0));
+    }
+  }
+}
+
+function drawParts() {
+  for (const p of S.parts) {
+    const a = Math.max(0, p.life / p.max);
+    if (p.k === 'cube') {
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.globalAlpha = Math.min(1, a * 1.6);
+      ctx.fillStyle = INK;
+      ctx.fillRect(-p.size / 2 - 1, -p.size / 2 - 1, p.size + 2, p.size + 2);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(-p.size / 2, -p.size / 2, p.size, p.size);
+      ctx.restore();
+    } else if (p.k === 'steam') {
+      ctx.globalAlpha = a * 0.55;
+      ctx.fillStyle = '#ece6dc';
+      circle(p.x, p.y, p.size);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    } else if (p.k === 'star') {
+      ctx.globalAlpha = Math.min(1, a * 1.5);
+      ctx.fillStyle = '#fff6c8';
+      starShape(p.x, p.y, p.size * (0.6 + a * 0.6));
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    } else if (p.k === 'ring') {
+      const t = 1 - a;
+      ctx.globalAlpha = a;
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth = p.lw * a + 1;
+      circle(p.x, p.y, lerp(p.r0, p.r1, easeOut(t)));
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    } else if (p.k === 'paper') {
+      // 撕下来的蓝图纸：翻着往下掉
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.scale(Math.cos(p.rot * 1.3), 1);
+      ctx.globalAlpha = Math.min(1, a * 1.5);
+      const s = p.size;
+      const pk = S.paperTex.width / S.L.bw;
+      ctx.drawImage(S.paperTex, p.sx * pk, p.sy * pk, s * pk, s * pk, -s / 2, -s / 2, s, s);
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = '#d8ecff';
+      ctx.strokeRect(-s / 2, -s / 2, s, s);
+      ctx.restore();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawTexts() {
+  const L = S.L;
+  for (const t of S.texts) {
+    const p = t.t / t.dur;
+    const s = t.t < 0.14 ? lerp(1.7, 1, backOut(t.t / 0.14)) : 1;
+    const a = p > 0.7 ? 1 - (p - 0.7) / 0.3 : 1;
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.translate(W / 2, L.by + L.bh * 0.42 - p * 26);
+    ctx.scale(s, s);
+    const colors = ['#fff3a0', '#ffd25a', '#ffab3d', '#ff7a45', '#ff5a8a', '#c88cff'];
+    const c = colors[Math.min(colors.length - 1, Math.max(0, t.chain - 2))];
+    text(t.str, 0, 0, t.size, c, 'center', INK);
+    ctx.restore();
+  }
+}
+
+// —— 下面的工坊：汐娘在造机关，连锁时会跳起来欢呼，木鸢从她的发射架飞出去 ——
+// 不动的部分（墙、窗、架子、挂着的蓝图）每关画一次存起来；会动的（齿轮、蒸汽、汐娘）每帧画
+let shopCache = null;
+function shopStatic(top, h) {
+  const key = top + '_' + h;
+  if (shopCache && shopCache.key === key) return shopCache.c;
+  const c = P.offscreen(W * DPR, h * DPR);
+  const x = c.getContext('2d');
+  x.scale(DPR, DPR);
+  const w = W - 16;
+  x.save();
+  rrOn(x, 8, 0, w, h - 8, 18);
+  x.clip();
+  // 墙：上砖下木
+  const g = x.createLinearGradient(0, 0, 0, h);
+  g.addColorStop(0, '#4a2e1f');
+  g.addColorStop(1, '#2a1a12');
+  x.fillStyle = g;
+  x.fillRect(0, 0, W, h);
+  x.strokeStyle = 'rgba(0,0,0,0.28)';
+  x.lineWidth = 1;
+  const wain = h * 0.62;
+  for (let y = 16, row = 0; y < wain; y += 16, row++) {
+    x.beginPath();
+    x.moveTo(8, y);
+    x.lineTo(W - 8, y);
+    x.stroke();
+    for (let xx = 8 + (row % 2) * 18; xx < W; xx += 36) {
+      x.beginPath();
+      x.moveTo(xx, y);
+      x.lineTo(xx, y + 16);
+      x.stroke();
+    }
+  }
+  x.fillStyle = '#5a3a26';
+  x.fillRect(0, wain, W, h - wain);
+  x.fillStyle = '#6e4a30';
+  x.fillRect(0, wain, W, 6);
+  x.strokeStyle = INK;
+  x.lineWidth = 2;
+  x.beginPath();
+  x.moveTo(0, wain);
+  x.lineTo(W, wain);
+  x.stroke();
+  x.strokeStyle = 'rgba(0,0,0,0.3)';
+  for (let xx = 30; xx < W; xx += 52) {
+    x.beginPath();
+    x.moveTo(xx, wain + 6);
+    x.lineTo(xx, h);
+    x.stroke();
+  }
+  // 圆窗：夜里的机关城
+  const wx = W * 0.5;
+  const wy = h * 0.3;
+  const wr = Math.min(46, h * 0.17);
+  x.save();
+  x.beginPath();
+  x.arc(wx, wy, wr, 0, Math.PI * 2);
+  x.clip();
+  const sky = x.createLinearGradient(0, wy - wr, 0, wy + wr);
+  sky.addColorStop(0, '#1b2440');
+  sky.addColorStop(1, '#3a3a60');
+  x.fillStyle = sky;
+  x.fillRect(wx - wr, wy - wr, wr * 2, wr * 2);
+  x.fillStyle = '#fff3c4';
+  x.beginPath();
+  x.arc(wx + wr * 0.4, wy - wr * 0.4, wr * 0.18, 0, Math.PI * 2);
+  x.fill();
+  x.fillStyle = '#141a2c';
+  for (let i = 0; i < 7; i++) x.fillRect(wx - wr + i * wr * 0.3, wy + wr * (0.1 - (i % 3) * 0.15), wr * 0.26, wr * 2);
+  x.fillStyle = '#ffcf6b';
+  for (let i = 0; i < 6; i++) x.fillRect(wx - wr * 0.8 + i * wr * 0.3, wy + wr * 0.35 + (i % 2) * wr * 0.15, 3, 3);
+  x.restore();
+  x.lineWidth = 6;
+  x.strokeStyle = BRASS;
+  x.beginPath();
+  x.arc(wx, wy, wr, 0, Math.PI * 2);
+  x.stroke();
+  x.lineWidth = 2;
+  x.strokeStyle = INK;
+  x.beginPath();
+  x.arc(wx, wy, wr + 3, 0, Math.PI * 2);
+  x.stroke();
+  x.beginPath();
+  x.arc(wx, wy, wr - 3, 0, Math.PI * 2);
+  x.stroke();
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2;
+    x.fillStyle = BRASS_D;
+    x.beginPath();
+    x.arc(wx + Math.cos(a) * wr, wy + Math.sin(a) * wr, 2, 0, Math.PI * 2);
+    x.fill();
+  }
+  // 墙上钉着的蓝图
+  const pin = (px0, py0, pw, ph, rot) => {
+    x.save();
+    x.translate(px0, py0);
+    x.rotate(rot);
+    x.fillStyle = '#2f67a0';
+    x.fillRect(-pw / 2, -ph / 2, pw, ph);
+    x.strokeStyle = 'rgba(220,240,255,0.55)';
+    x.lineWidth = 1;
+    x.beginPath();
+    x.arc(-pw * 0.1, 0, ph * 0.25, 0, Math.PI * 2);
+    x.moveTo(-pw * 0.4, ph * 0.3);
+    x.lineTo(pw * 0.4, ph * 0.3);
+    x.moveTo(pw * 0.2, -ph * 0.35);
+    x.lineTo(pw * 0.2, ph * 0.2);
+    x.stroke();
+    x.strokeStyle = INK;
+    x.lineWidth = 1.5;
+    x.strokeRect(-pw / 2, -ph / 2, pw, ph);
+    x.fillStyle = '#d9484d';
+    x.beginPath();
+    x.arc(0, -ph / 2 + 3, 3, 0, Math.PI * 2);
+    x.fill();
+    x.restore();
+  };
+  pin(W * 0.27, h * 0.36, 50, 38, -0.08);
+  pin(W * 0.73, h * 0.2, 44, 34, 0.06);
+  // 架子：水银瓶、书、零件
+  const sy = h * 0.42;
+  x.fillStyle = '#6b4630';
+  x.fillRect(W * 0.64, sy, W * 0.3, 7);
+  x.strokeStyle = INK;
+  x.lineWidth = 2;
+  x.strokeRect(W * 0.64, sy, W * 0.3, 7);
+  for (let i = 0; i < 3; i++) {
+    const jx = W * 0.67 + i * 18;
+    x.fillStyle = i === 1 ? '#a8ece8' : '#7fd6cf';
+    rrOn(x, jx, sy - 20, 13, 20, 4);
+    x.fill();
+    x.stroke();
+    x.fillStyle = BRASS;
+    x.fillRect(jx + 2, sy - 24, 9, 5);
+    x.strokeRect(jx + 2, sy - 24, 9, 5);
+  }
+  for (let i = 0; i < 3; i++) {
+    x.fillStyle = ['#c26a3d', '#3f6170', '#9a6b2a'][i];
+    x.fillRect(W * 0.84 + i * 9, sy - 24 + i * 2, 8, 24 - i * 2);
+    x.strokeRect(W * 0.84 + i * 9, sy - 24 + i * 2, 8, 24 - i * 2);
+  }
+  // 顶上一根大管子
+  x.fillStyle = '#8a6036';
+  x.fillRect(0, 10, W, 12);
+  x.strokeStyle = INK;
+  x.strokeRect(-2, 10, W + 4, 12);
+  for (const vx of [W * 0.12, W * 0.88]) {
+    x.fillStyle = BRASS;
+    x.fillRect(vx - 6, 6, 12, 20);
+    x.strokeRect(vx - 6, 6, 12, 20);
+  }
+  x.restore();
+  rrOn(x, 8, 0, w, h - 8, 18);
+  x.lineWidth = 3;
+  x.strokeStyle = INK;
+  x.stroke();
+  shopCache = { key, c };
+  return c;
+}
+
+function drawShop() {
+  const L = S.L;
+  const top = L.shopTop;
+  const h = H - top;
+  if (h < 80) return;
+  ctx.drawImage(shopStatic(top, h), 0, top, W, h);
+  ctx.save();
+  rr(8, top, W - 16, h - 8, 18);
+  ctx.clip();
+  const floorY = H - 30;
+  // 吊灯（会微微晃）
+  const sw = Math.sin(S.time * 1.3) * 0.04;
+  const lx = W * 0.5 + Math.sin(sw) * 40;
+  const ly = top + h * 0.3 - Math.min(46, h * 0.17) - 6;
+  const glow = ctx.createRadialGradient(lx, ly + 20, 4, lx, ly + 40, h * 0.9);
+  glow.addColorStop(0, 'rgba(255,196,100,' + (0.32 + 0.04 * Math.sin(S.time * 7)) + ')');
+  glow.addColorStop(1, 'rgba(255,196,100,0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(0, top, W, h);
+  // 齿轮组（欢呼时转得快）
+  const spd = S.cheer > 0 ? 4 : 0.6;
+  const gy = top + h * 0.62;
+  ART.gear(ctx, W * 0.1, gy + 4, 30, 10, BRASS, S.time * spd, 2);
+  ART.gear(ctx, W * 0.1 + 42, gy - 18, 18, 8, '#c26a3d', -S.time * spd * 1.6, 2);
+  // 蒸汽阀冒汽
+  if (S.cheer > 0 && S.phase !== 'win' && Math.random() < 0.3) steam(W * (Math.random() < 0.5 ? 0.12 : 0.88), top + 30, 1);
+  // 工作台 + 正在造的铜雀
+  const bw = Math.min(130, W * 0.34);
+  const bx = W * 0.5 - bw / 2 - 10;
+  const by = floorY - 46;
+  ctx.fillStyle = '#7a5236';
+  ctx.fillRect(bx, by, bw, 13);
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(bx, by, bw, 13);
+  ctx.fillStyle = '#5a3a26';
+  ctx.fillRect(bx + 8, by + 13, 10, 33);
+  ctx.strokeRect(bx + 8, by + 13, 10, 33);
+  ctx.fillRect(bx + bw - 18, by + 13, 10, 33);
+  ctx.strokeRect(bx + bw - 18, by + 13, 10, 33);
+  ART.bird(ctx, bx + bw * 0.35, by - 14, 34, Math.sin(S.time * 2) * 0.06);
+  ART.gear(ctx, bx + bw * 0.75, by - 9, 9, 8, BRASS_L, S.time, 1.5);
+  // 木鸢发射架（连锁奖励的木鸢从这里飞上去）
+  const lc = L.launch;
+  ctx.fillStyle = '#4a2f20';
+  ctx.beginPath();
+  ctx.moveTo(lc.x - 14, floorY);
+  ctx.lineTo(lc.x - 3, lc.y + 6);
+  ctx.lineTo(lc.x + 3, lc.y + 6);
+  ctx.lineTo(lc.x + 14, floorY);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = BRASS;
+  circle(lc.x, lc.y + 6, 6);
+  ctx.fill();
+  ctx.stroke();
+  // 汐娘（欢呼时跳起来、举手）
+  const cheer = S.cheer > 0;
+  const jump = cheer ? Math.abs(Math.sin(S.time * 9)) * 14 : Math.abs(Math.sin(S.time * 2)) * 1.5;
+  const hs = Math.min(150, h * 0.56);
+  ctx.fillStyle = 'rgba(0,0,0,0.3)';
+  ctx.beginPath();
+  ctx.ellipse(W * 0.85, floorY + 2, hs * 0.2, 5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ART.xiniang(ctx, W * 0.85, floorY - jump, hs, cheer || Math.floor(S.time * 1.2) % 3 === 0 ? 'work' : 'stand');
+  ctx.restore();
+  if (S.phase === 'win' || S.phase === 'lose') return;
+  // 画册按钮
+  const ab = { x: 20, y: top + 34, w: 92, h: 42 };
+  rr(ab.x, ab.y + 3, ab.w, ab.h, 13);
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.fill();
+  rr(ab.x, ab.y, ab.w, ab.h, 13);
+  ctx.fillStyle = '#5a3a2a';
+  ctx.fill();
+  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = INK;
+  ctx.stroke();
+  bookIcon(ab.x + 23, ab.y + ab.h / 2);
+  text('画册', ab.x + 60, ab.y + ab.h / 2 + 1, 15, '#f3dfb0');
+  S.buttons.push({ id: 'album', x: ab.x, y: ab.y, w: ab.w, h: ab.h, fn: openAlbum });
+}
+
+function bookIcon(x, y) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.fillStyle = '#c26a3d';
+  rr(-10, -9, 20, 18, 3);
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = INK;
+  ctx.stroke();
+  ctx.fillStyle = '#f3dfb0';
+  ctx.fillRect(-6, -5, 12, 3);
+  ctx.restore();
+}
+
+function drawHand(x, y, press) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(press ? 0.9 : 1, press ? 0.9 : 1);
+  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = INK;
+  ctx.fillStyle = '#fff4e6';
+  // 手指
+  rr(-7, -4, 14, 34, 7);
+  ctx.fill();
+  ctx.stroke();
+  // 手掌
+  rr(-12, 18, 30, 30, 10);
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+  if (press) {
+    ctx.strokeStyle = 'rgba(255,240,180,0.9)';
+    ctx.lineWidth = 3;
+    circle(x, y - 4, 14);
+    ctx.stroke();
+  }
+}
+
+// 第一次玩：手指示范划一下
+function drawTutorial() {
+  if (save.tut || S.phase !== 'idle' || S.levelNo !== 0) return;
+  const m = S.tutMove && S.g.cells[S.tutMove.a] && S.g.cells[S.tutMove.b] ? S.tutMove : (S.tutMove = core.bestMove(S.g));
+  if (!m) return;
+  const a = cellCenter(m.a);
+  const b = cellCenter(m.b);
+  const ph = (S.time % 1.4) / 1.4;
+  const t = ph < 0.25 ? 0 : ph < 0.7 ? easeOut((ph - 0.25) / 0.45) : 1;
+  const L = S.L;
+  // 两格亮边
+  for (const c of [a, b]) {
+    rr(c.x - L.cs / 2 + 2, c.y - L.cs / 2 + 2, L.cs - 4, L.cs - 4, 8);
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(255,240,170,' + (0.6 + 0.4 * Math.sin(S.time * 8)) + ')';
+    ctx.stroke();
+  }
+  drawHand(lerp(a.x, b.x, t) + 6, lerp(a.y, b.y, t) + 8, ph > 0.15 && ph < 0.75);
+}
+
+// —— 结算页 ——
+function button(id, x, y, w, h, label, kind, fn) {
+  rr(x, y + 4, w, h, h / 2);
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fill();
+  rr(x, y, w, h, h / 2);
+  ctx.fillStyle = kind === 'primary' ? '#f2b84b' : kind === 'ad' ? '#3fa66b' : '#4a3226';
+  ctx.fill();
+  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = INK;
+  ctx.stroke();
+  if (kind === 'primary' || kind === 'ad') {
+    rr(x + 6, y + 4, w - 12, h * 0.36, h * 0.18);
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.fill();
+  }
+  text(label, x + w / 2, y + h / 2 + 1, kind === 'primary' ? Math.min(22, h * 0.4) : Math.min(18, h * 0.36), kind === 'primary' ? INK : '#fff');
+  S.buttons.push({ id, x, y, w, h, fn });
+}
+
+function sheet(y, h) {
+  rr(12, y + 4, W - 24, h, 22);
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.fill();
+  rr(12, y, W - 24, h, 22);
+  ctx.fillStyle = 'rgba(34,22,28,0.97)';
+  ctx.fill();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = BRASS;
+  ctx.stroke();
+}
+
+// 结算页从底下弹上来，高度按内容定，盖住下面的工坊、不挡上面的插画
+function panelTop(t, ph) {
+  const target = Math.max(S.L.by + S.L.bh * 0.55, H - ph - 14);
+  return lerp(H + 10, target, backOut(t));
+}
+
+function drawWinPanel() {
+  if (S.endT < 1.2) return;
+  const t = (S.endT - 1.2) / 0.3;
+  const ph = 286;
+  const y0 = panelTop(t, ph);
+  sheet(y0, ph);
+  // 汐娘在结算页右边跳着欢呼
+  ctx.save();
+  rr(12, y0, W - 24, ph, 22);
+  ctx.clip();
+  ART.xiniang(ctx, W - 58, y0 + 126 - Math.abs(Math.sin(S.time * 8)) * 10, 96, 'work');
+  ctx.restore();
+  const s = S.endT < 1.5 ? lerp(1.6, 1, backOut((S.endT - 1.2) / 0.3)) : 1;
+  ctx.save();
+  ctx.translate(W / 2, y0 + 42);
+  ctx.scale(s, s);
+  text('过关！', 0, 0, 40, '#ffd25a', 'center', INK);
+  ctx.restore();
+  const li = (S.levelNo % LEVELS.length);
+  text('「' + ART.CAPTIONS[li] + '」收进画册', W / 2, y0 + 84, 15, '#f3dfb0');
+  coinIcon(W / 2 - 26, y0 + 114, 9);
+  text('+' + S.reward, W / 2 - 12, y0 + 115, 20, '#fff3c4', 'left', INK);
+  const bw = W - 80;
+  let by = y0 + 140;
+  button('next', 40, by, bw, 58, '下一关 ▶', 'primary', nextLevel);
+  by += 70;
+  button('album', 40 + bw * 0.2, by, bw * 0.6, 44, '📖 看画册', 'plain', openAlbum);
+}
+
+function drawFailPanel() {
+  if (S.endT < 0.45) return;
+  const g = S.g;
+  const t = (S.endT - 0.45) / 0.25;
+  const ph = S.adsUsed < 2 ? 268 : 204;
+  const y0 = panelTop(t, ph);
+  sheet(y0, ph);
+  const left = g.paperLeft;
+  text(left <= 3 ? '就差一点！' : '没步数了', W / 2, y0 + 28, 16, left <= 3 ? '#ffcf6b' : '#c9b8c0');
+  text('还剩 ' + left + ' 格', W / 2, y0 + 66, 36, '#fff', 'center', INK);
+  const bw = W - 100;
+  const done = 1 - left / g.paperTotal;
+  rr(50, y0 + 96, bw, 16, 8);
+  ctx.fillStyle = '#120c12';
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = INK;
+  ctx.stroke();
+  rr(52, y0 + 98, Math.max(12, (bw - 4) * done), 12, 6);
+  ctx.fillStyle = BRASS;
+  ctx.fill();
+  const bwid = W - 80;
+  let by = y0 + 128;
+  if (S.adsUsed < 2) {
+    button('ad', 40, by, bwid, 52, '📺 再给 5 步', 'ad', () =>
+      showAd(() => {
+        S.adsUsed++;
+        save.coins -= S.reward; // 接着打：失败给的金币先收回
+        S.reward = 0;
+        persist();
+        core.addMoves(S.g, 5);
+        setPhase('idle');
+        S.idleT = 0;
+      })
+    );
+    by += 64;
+  }
+  button('retry', 40, by, bwid, 56, '↻ 再来', 'primary', retry);
+}
+
+function showAd(cb) {
+  P.sound('tap', 0.5);
+  S.ad = { t: 3, cb };
+}
+
+function drawAd() {
+  ctx.fillStyle = 'rgba(0,0,0,0.9)';
+  ctx.fillRect(0, 0, W, H);
+  text('广告', W / 2, H / 2 - 40, 22, '#fff');
+  text(String(Math.max(1, Math.ceil(S.ad.t))), W / 2, H / 2 + 10, 48, '#ffcf6b');
+  text('（试玩版不放真广告，3 秒后给 5 步）', W / 2, H / 2 + 64, 12, '#9a8a90', 'center', null, 'normal');
+}
+
+function retry() {
+  P.sound('tap', 0.5);
+  startLevel();
+}
+
+function nextLevel() {
+  P.sound('tap', 0.5);
+  S.albumOpen = false;
+  startLevel();
+}
+
+function openAlbum() {
+  P.sound('tap', 0.5);
+  S.albumOpen = true;
+}
+
+const thumbCache = {};
+function thumb(i, s) {
+  const key = i + '_' + s;
+  if (!thumbCache[key]) {
+    const c = P.offscreen(s * DPR, s * DPR);
+    const x = c.getContext('2d');
+    x.scale(DPR, DPR);
+    ART.draw(x, i, s);
+    thumbCache[key] = c;
+  }
+  return thumbCache[key];
+}
+
+function drawAlbum() {
+  ctx.fillStyle = '#160e16';
+  ctx.fillRect(0, 0, W, H);
+  const top = Math.max(10, scr.safeTop + 6);
+  text('画册', W / 2, top + 26, 24, '#ffd25a', 'center', INK);
+  let got = 0;
+  for (let i = 0; i < LEVELS.length; i++) if (save.album[i]) got++;
+  text(got + ' / ' + LEVELS.length, W / 2, top + 54, 13, '#c9b8c0', 'center', null, 'normal');
+  const gap = 14;
+  const ts = Math.floor(Math.min((W - 40 - gap) / 2, (H - top - 160) / 3 - 30));
+  const x0 = (W - ts * 2 - gap) / 2;
+  for (let i = 0; i < LEVELS.length; i++) {
+    const x = x0 + (i % 2) * (ts + gap);
+    const y = top + 74 + Math.floor(i / 2) * (ts + 32);
+    rr(x - 4, y - 4, ts + 8, ts + 8, 10);
+    ctx.fillStyle = BRASS_D;
+    ctx.fill();
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = INK;
+    ctx.stroke();
+    if (save.album[i]) {
+      ctx.drawImage(thumb(i, ts), x, y, ts, ts);
+      text(ART.CAPTIONS[i], x + ts / 2, y + ts + 16, 13, '#f3dfb0');
+    } else {
+      ctx.fillStyle = '#2a5585';
+      ctx.fillRect(x, y, ts, ts);
+      ctx.strokeStyle = 'rgba(160,200,240,0.25)';
+      ctx.lineWidth = 1;
+      for (let k = 1; k < 6; k++) {
+        ctx.beginPath();
+        ctx.moveTo(x + (k * ts) / 6, y);
+        ctx.lineTo(x + (k * ts) / 6, y + ts);
+        ctx.moveTo(x, y + (k * ts) / 6);
+        ctx.lineTo(x + ts, y + (k * ts) / 6);
+        ctx.stroke();
+      }
+      text('?', x + ts / 2, y + ts / 2, 40, 'rgba(220,235,255,0.6)');
+      text('第 ' + (i + 1) + ' 关', x + ts / 2, y + ts + 16, 13, '#8a7a80', 'center', null, 'normal');
+    }
+  }
+  button('close', W / 2 - 80, H - 72, 160, 50, '返回', 'primary', () => {
+    P.sound('tap', 0.5);
+    S.albumOpen = false;
+  });
+}
+
+// —— 一帧画面 ——
+function render() {
+  S.buttons = [];
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.globalAlpha = 1;
+  drawBackground();
+  if (!S.g) return;
+  ctx.save();
+  if (S.shake > 0) ctx.translate((Math.random() - 0.5) * S.shake, (Math.random() - 0.5) * S.shake);
+  drawBoard();
+  drawFx();
+  drawParts();
+  drawTexts();
+  drawTutorial();
+  ctx.restore();
+  drawHud();
+  drawShop();
+  if (S.flash > 0) {
+    ctx.fillStyle = 'rgba(255,252,240,' + S.flash * 0.7 + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+  if (S.phase === 'win') drawWinPanel();
+  if (S.phase === 'lose') drawFailPanel();
+  if (S.albumOpen) {
+    S.buttons = [];
+    drawAlbum();
+  }
+  if (S.ad) drawAd();
+}
+
+// —— 手势：在相邻两块之间划一下，或先点一块再点旁边一块 ——
+function cellAt(x, y) {
+  const L = S.L;
+  const g = S.g;
+  const cx = Math.floor((x - L.bx) / L.cs);
+  const cy = Math.floor((y - L.by) / L.cs);
+  if (!core.valid(g, cx, cy)) return -1;
+  return cy * g.w + cx;
+}
+
+function onTouch(type, id, x, y) {
+  if (S.ad) return;
+  if (type === 'down') {
+    for (let i = S.buttons.length - 1; i >= 0; i--) {
+      const b = S.buttons[i];
+      if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) {
+        b.fn();
+        return;
+      }
+    }
+    if (S.albumOpen) return;
+    S.idleT = 0;
+    S.hint = null;
+    if (S.phase !== 'idle') return;
+    const idx = cellAt(x, y);
+    if (idx < 0) {
+      S.sel = -1;
+      return;
+    }
+    if (S.sel >= 0 && S.sel !== idx && adjacent(S.sel, idx)) {
+      const a = S.sel;
+      S.sel = -1;
+      requestSwap(a, idx);
+      return;
+    }
+    S.sel = idx;
+    S.drag = { id, idx, x, y };
+  } else if (type === 'move') {
+    const d = S.drag;
+    if (!d || d.id !== id || S.phase !== 'idle') return;
+    const dx = x - d.x;
+    const dy = y - d.y;
+    const th = S.L.cs * 0.3;
+    if (Math.abs(dx) < th && Math.abs(dy) < th) return;
+    const g = S.g;
+    const c = cellXY(d.idx);
+    const nx = c.x + (Math.abs(dx) > Math.abs(dy) ? Math.sign(dx) : 0);
+    const ny = c.y + (Math.abs(dx) > Math.abs(dy) ? 0 : Math.sign(dy));
+    S.drag = null;
+    if (!core.valid(g, nx, ny)) return;
+    S.sel = -1;
+    requestSwap(d.idx, ny * g.w + nx);
+  } else if (type === 'up') {
+    if (S.drag && S.drag.id === id) S.drag = null;
+  }
+}
+
+// —— 跑起来：每帧固定步长更新 ——
+let last = P.now();
+let acc = 0;
+function frame() {
+  const t = P.now();
+  const dt = Math.min(0.1, Math.max(0, (t - last) / 1000));
+  last = t;
+  acc += dt * S.timeScale;
+  let n = 0;
+  while (acc >= STEP && n < 40) {
+    update(STEP);
+    acc -= STEP;
+    n++;
+  }
+  if (n >= 40) acc = 0;
+  render();
+  P.nextFrame(frame);
+}
+
+startLevel();
+frame();
+
+P.exposeForTest('__a', {
+  S,
+  save,
+  core,
+  LEVELS,
+  W,
+  H,
+  cellCenter,
+  startLevel,
+  retry,
+  nextLevel,
+  persist,
+});
+
+});
+__def("js/platform.js", function (module, exports, require) {
+// 平台层：只有这个文件知道自己跑在微信里还是浏览器里。
+// 微信小游戏：wx.createCanvas / wx.onTouchStart / wx.createRewardedVideoAd
+// 浏览器预览：一张 <canvas id="game">，用 pointer 事件（只用一种事件，免得一次点击被算两次）
+const isWx = typeof wx !== 'undefined' && wx && typeof wx.createCanvas === 'function';
+
+function setup(onTouch) {
+  let canvas, width, height, dpr;
+  let safeTop = 0;
+  if (isWx) {
+    canvas = wx.createCanvas();
+    const info = (wx.getWindowInfo && wx.getWindowInfo()) || wx.getSystemInfoSync();
+    width = info.windowWidth;
+    height = info.windowHeight;
+    dpr = info.pixelRatio || 2;
+    safeTop = (info.safeArea && info.safeArea.top) || info.statusBarHeight || 20;
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    const send = (type) => (e) => {
+      const list = e.changedTouches || [];
+      for (let i = 0; i < list.length; i++) {
+        onTouch(type, list[i].identifier, list[i].clientX, list[i].clientY);
+      }
+    };
+    wx.onTouchStart((e) => {
+      unlockAudio();
+      send('down')(e);
+    });
+    wx.onTouchMove(send('move'));
+    wx.onTouchEnd(send('up'));
+    wx.onTouchCancel(send('up'));
+  } else {
+    canvas = document.getElementById('game');
+    // 电脑上预览时装成一部手机大小；手机浏览器里就占满屏
+    const phone = window.innerWidth > 520;
+    width = phone ? 390 : window.innerWidth;
+    height = phone ? Math.min(844, window.innerHeight - 20) : window.innerHeight;
+    dpr = window.devicePixelRatio || 2;
+    canvas.style.width = width + 'px';
+    canvas.style.height = height + 'px';
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    const pos = (e) => {
+      const r = canvas.getBoundingClientRect();
+      return [e.clientX - r.left, e.clientY - r.top];
+    };
+    canvas.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      unlockAudio();
+      canvas.setPointerCapture(e.pointerId);
+      const p = pos(e);
+      onTouch('down', e.pointerId, p[0], p[1]);
+    });
+    canvas.addEventListener('pointermove', (e) => {
+      const p = pos(e);
+      onTouch('move', e.pointerId, p[0], p[1]);
+    });
+    const up = (e) => {
+      const p = pos(e);
+      onTouch('up', e.pointerId, p[0], p[1]);
+    };
+    canvas.addEventListener('pointerup', up);
+    canvas.addEventListener('pointercancel', up);
+  }
+  return { canvas, ctx: canvas.getContext('2d'), width, height, dpr, safeTop };
+}
+
+// 画在内存里的一张画布（插画、盖在上面的像素层都先画在这里，每帧只贴一次）
+function offscreen(w, h) {
+  let c;
+  if (isWx) c = wx.createCanvas();
+  else c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(w));
+  c.height = Math.max(1, Math.round(h));
+  return c;
+}
+
+function now() {
+  return Date.now();
+}
+
+function nextFrame(fn) {
+  return requestAnimationFrame(fn);
+}
+
+function vibrate(strong) {
+  if (isWx && wx.vibrateShort) {
+    wx.vibrateShort({ type: strong ? 'heavy' : 'light', fail() {} });
+  } else if (typeof navigator !== 'undefined' && navigator.vibrate) {
+    navigator.vibrate(strong ? 30 : 10);
+  }
+}
+
+// 激励视频。填了广告位 id 且在微信里才放真广告，返回 true；
+// 否则返回 false，由游戏自己放「广告占位」倒计时。
+let rewardedAd = null;
+function showRewardedAd(adUnitId, onReward, onSkip) {
+  if (!isWx || !adUnitId || !wx.createRewardedVideoAd) return false;
+  if (!rewardedAd) rewardedAd = wx.createRewardedVideoAd({ adUnitId });
+  rewardedAd.offClose();
+  rewardedAd.onClose((res) => {
+    // 旧版基础库 res 为 undefined，算看完
+    if (!res || res.isEnded) onReward();
+    else onSkip();
+  });
+  rewardedAd.show().catch(() => {
+    rewardedAd.load().then(() => rewardedAd.show()).catch(() => onReward());
+  });
+  return true;
+}
+
+// 音效：WebAudio（微信 wx.createWebAudioContext，浏览器 AudioContext）。放不出来就安静，不报错
+const sfx = require('./sfx.js');
+let audio = null;
+const buffers = {};
+let muted = false;
+function audioCtx() {
+  if (audio !== null) return audio;
+  try {
+    if (isWx && wx.createWebAudioContext) audio = wx.createWebAudioContext();
+    else if (typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext)) audio = new (window.AudioContext || window.webkitAudioContext)();
+    else audio = false;
+  } catch (e) {
+    audio = false;
+  }
+  return audio;
+}
+// 浏览器要在手指点下去的那一刻打开声音
+function unlockAudio() {
+  const a = audioCtx();
+  if (a && a.state === 'suspended' && a.resume) a.resume();
+}
+function sound(name, volume) {
+  if (muted) return;
+  const a = audioCtx();
+  if (!a) return;
+  try {
+    if (!buffers[name]) {
+      const sr = 22050;
+      const data = sfx.make(name, sr);
+      if (!data) return;
+      const buf = a.createBuffer(1, data.length, sr);
+      buf.getChannelData(0).set(data);
+      buffers[name] = buf;
+    }
+    const src = a.createBufferSource();
+    src.buffer = buffers[name];
+    const g = a.createGain();
+    g.gain.value = volume === undefined ? 0.6 : volume;
+    src.connect(g);
+    g.connect(a.destination);
+    src.start(0);
+  } catch (e) {
+    // 放不出声音就算了
+  }
+}
+function setMuted(v) {
+  muted = !!v;
+}
+
+// 存档：微信用 wx.setStorageSync，浏览器用 localStorage
+function load(key) {
+  try {
+    const raw = isWx ? wx.getStorageSync(key) : window.localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function save(key, value) {
+  try {
+    const raw = JSON.stringify(value);
+    if (isWx) wx.setStorageSync(key, raw);
+    else window.localStorage.setItem(key, raw);
+  } catch (e) {
+    // 存不了就算了：原型里不影响玩
+  }
+}
+
+function exposeForTest(name, value) {
+  if (!isWx && typeof window !== 'undefined') window[name] = value;
+}
+
+module.exports = { isWx, setup, offscreen, now, nextFrame, vibrate, showRewardedAd, load, save, exposeForTest, sound, unlockAudio, setMuted };
+
+});
+__def("js/sfx.js", function (module, exports, require) {
+// 音效：全部用代码合成（不用音频文件），微信和浏览器都用 WebAudio 播放（见 platform.js 的 sound()）。
+// make(name, sr) 返回一串 -1..1 的采样。以后换正式音效只要换这里。
+
+function env(t, a, d) {
+  return t < a ? t / a : Math.exp(-(t - a) / d);
+}
+
+function noise(seed) {
+  let s = seed || 1;
+  return () => {
+    s = (s * 16807) % 2147483647;
+    return (s / 2147483647) * 2 - 1;
+  };
+}
+
+const sin = (f, t) => Math.sin(2 * Math.PI * f * t);
+const sq = (f, t) => Math.sign(Math.sin(2 * Math.PI * f * t));
+const tri = (f, t) => {
+  const p = (f * t) % 1;
+  return p < 0.5 ? p * 4 - 1 : 3 - p * 4;
+};
+const at = (t, s, a, d) => (t > s ? env(t - s, a, d) : 0);
+
+const RECIPES = {
+  // 划一下：轻轻「嗖」
+  swap: { len: 0.12, f: (t, n) => n() * env(t, 0.01, 0.03) * 0.18 + sin(500 + 900 * t, t) * env(t, 0.005, 0.04) * 0.15 },
+  // 换了不成消，弹回去：闷闷的「咚」
+  bonk: { len: 0.22, f: (t) => (sin(130 - 60 * t, t) * 0.7 + sin(65, t) * 0.3) * env(t, 0.002, 0.07) * 0.8 },
+  // 生成特效块：亮晶晶往上走
+  make: { len: 0.45, f: (t) => { const i = Math.min(3, Math.floor(t / 0.07)); const k = t - i * 0.07; return (tri([784, 988, 1175, 1568][i], t) * 0.5 + sin([784, 988, 1175, 1568][i] * 2, t) * 0.2) * env(k, 0.003, i === 3 ? 0.18 : 0.05) * 0.4; } },
+  // 连弩：蒸汽「嗤——」+ 弦响
+  line: { len: 0.45, f: (t, n) => n() * env(t, 0.005, 0.12) * 0.4 * (0.6 + 0.4 * sin(30, t)) + sq(180 - 120 * t, t) * env(t, 0.001, 0.05) * 0.18 },
+  // 齿轮炸弹：低沉「轰」
+  bomb: { len: 0.7, f: (t, n) => n() * env(t, 0.003, 0.18) * 0.55 + sin(70 - 40 * t, t) * env(t, 0.002, 0.25) * 0.6 },
+  // 铜雀起飞：一串鸟鸣
+  bird: { len: 0.8, f: (t) => { const k = (t * 9) % 1; return sin(1800 + 900 * Math.sin(k * 6.28) + 400 * t, t) * env(k / 9, 0.004, 0.035) * 0.35 * (1 - t / 0.9); } },
+  // 木鸢：呼呼转
+  kite: { len: 0.35, f: (t, n) => (n() * 0.3 + sin(260, t) * 0.4) * env(t, 0.03, 0.12) * (0.5 + 0.5 * sin(24, t)) * 0.4 },
+  // 撕纸：短促沙啦
+  tear: { len: 0.13, f: (t, n) => n() * env(t, 0.004, 0.03) * 0.3 * (0.5 + 0.5 * sq(90, t)) },
+  // 两个特效块组合：大招
+  combo: { len: 1.0, f: (t, n) => sin(110 + 500 * t, t) * env(t, 0.02, 0.35) * 0.45 + n() * at(t, 0.08, 0.004, 0.3) * 0.45 + sin(55, t) * env(t, 0.01, 0.4) * 0.4 },
+  // 洗牌：哗啦啦
+  shuffle: { len: 0.5, f: (t, n) => n() * (0.5 + 0.5 * sq(16, t)) * env(t, 0.05, 0.2) * 0.25 },
+  // 过关：一串往上的和弦，最后一个长音
+  win: { len: 1.5, f: (t) => { const ns = [523, 659, 784, 1047]; let s = 0; for (let i = 0; i < 4; i++) s += (sin(ns[i], t) + 0.3 * sin(ns[i] * 2, t)) * at(t, i * 0.09, 0.005, i === 3 ? 0.6 : 0.5); return s * 0.2; } },
+  // 插画亮出来：白闪的大和弦
+  reveal: { len: 1.6, f: (t, n) => { const ns = [523, 659, 784, 1047, 1319]; let s = 0; for (const f of ns) s += sin(f, t); return s * env(t, 0.02, 0.6) * 0.1 + n() * env(t, 0.01, 0.08) * 0.15; } },
+  // 没步了
+  lose: { len: 0.8, f: (t) => tri(330 - 180 * t, t) * env(t, 0.01, 0.3) * 0.35 },
+  // 金币
+  coin: { len: 0.2, f: (t) => sq(t < 0.06 ? 1320 : 1760, t) * env(t < 0.06 ? t : t - 0.06, 0.002, 0.05) * 0.2 },
+  // 按钮
+  tap: { len: 0.08, f: (t) => sq(660, t) * env(t, 0.001, 0.02) * 0.2 },
+  // 广告倒计时
+  tick: { len: 0.05, f: (t) => sin(1200, t) * env(t, 0.001, 0.015) * 0.3 },
+};
+
+// 消除：「啵」，连锁一级级往上升（pop0 … pop11），越高越亮
+for (let i = 0; i < 12; i++) {
+  const f = 440 * Math.pow(2, (i * 2) / 12);
+  RECIPES['pop' + i] = {
+    len: 0.16,
+    f: (t, n) => (tri(f * (1 + 0.6 * env(t, 0.001, 0.02)), t) * 0.55 + sin(f * 2, t) * 0.2 + n() * env(t, 0.001, 0.008) * 0.4) * env(t, 0.002, 0.05) * 0.55,
+  };
+}
+
+function make(name, sr) {
+  const r = RECIPES[name];
+  if (!r) return null;
+  const n = Math.floor(r.len * sr);
+  const out = new Float32Array(n);
+  const rnd = noise(name.length * 7919 + 3);
+  for (let i = 0; i < n; i++) out[i] = Math.max(-1, Math.min(1, r.f(i / sr, rnd)));
+  return out;
+}
+
+module.exports = { make, NAMES: Object.keys(RECIPES) };
+
+});
+__require('')('./game.js');
+</script>
+</body>
+</html>
