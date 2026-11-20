@@ -1495,6 +1495,9 @@ function cellCenter(idx) {
 // —— 开一关 ——
 function startLevel() {
   S.levelNo = save.level;
+  S.queued = null;
+  S.drag = null;
+  S.busyT = 0;
   S.def = LEVELS[S.levelNo % LEVELS.length];
   S.g = core.newGame(S.def);
   S.L = layout(S.g);
@@ -1530,6 +1533,13 @@ function startLevel() {
 function setPhase(p) {
   S.phase = p;
   S.phaseT = 0;
+  if (p === 'idle') S.busyT = 0;
+}
+
+// 连锁播太久会让人以为卡死（实测 15% 的交换要等 3 秒以上）：忙了 1.2 秒后很快加速，最快 4 倍
+function rushRate() {
+  if (S.phase !== 'steps' && S.phase !== 'swap' && S.phase !== 'shuffle') return 1;
+  return Math.min(4, 1 + Math.max(0, (S.busyT || 0) - 1.2) * 3);
 }
 
 // 蓝图纸 / 插画 / 棋盘框：每关画一次，存在离屏画布里
@@ -2028,6 +2038,15 @@ function update(dt) {
       }
       break;
     case 'idle':
+      if (S.queued) {
+        const q = S.queued;
+        S.queued = null;
+        // 只在那格还是原来那块、而且排队不到 2.5 秒时执行，免得换到不想换的块
+        if (S.time - q.at < 2.5 && S.g.cells[q.a] && S.g.cells[q.a].id === q.pid) {
+          requestSwap(q.a, q.b);
+          break;
+        }
+      }
       S.idleT += dt;
       if (S.idleT > 3 && !S.hint) S.hint = core.bestMove(g);
       break;
@@ -3514,7 +3533,12 @@ function onTouch(type, id, x, y) {
     if (S.albumOpen) return;
     S.idleT = 0;
     S.hint = null;
-    if (S.phase !== 'idle') return;
+    if (S.phase !== 'idle') {
+      // 动画还没停：先记下按在哪一格，划出去时排队
+      const bi = cellAt(x, y);
+      if (bi >= 0 && S.phase !== 'win' && S.phase !== 'lose' && S.g.cells[bi]) S.drag = { id, idx: bi, x, y, pid: S.g.cells[bi].id, early: true };
+      return;
+    }
     const idx = cellAt(x, y);
     if (idx < 0) {
       S.sel = -1;
@@ -3530,7 +3554,7 @@ function onTouch(type, id, x, y) {
     S.drag = { id, idx, x, y };
   } else if (type === 'move') {
     const d = S.drag;
-    if (!d || d.id !== id || S.phase !== 'idle') return;
+    if (!d || d.id !== id) return;
     const dx = x - d.x;
     const dy = y - d.y;
     const th = S.L.cs * 0.3;
@@ -3542,6 +3566,10 @@ function onTouch(type, id, x, y) {
     S.drag = null;
     if (!core.valid(g, nx, ny)) return;
     S.sel = -1;
+    if (S.phase !== 'idle') {
+      if (S.phase !== 'win' && S.phase !== 'lose') S.queued = { a: d.idx, b: ny * g.w + nx, pid: d.pid !== undefined ? d.pid : g.cells[d.idx] && g.cells[d.idx].id, at: S.time };
+      return;
+    }
     requestSwap(d.idx, ny * g.w + nx);
   } else if (type === 'up') {
     if (S.drag && S.drag.id === id) S.drag = null;
@@ -3555,7 +3583,8 @@ function frame() {
   const t = P.now();
   const dt = Math.min(0.1, Math.max(0, (t - last) / 1000));
   last = t;
-  acc += dt * S.timeScale;
+  if (S.phase !== 'idle') S.busyT = (S.busyT || 0) + dt;
+  acc += dt * S.timeScale * rushRate();
   let n = 0;
   while (acc >= STEP && n < 40) {
     update(STEP);
