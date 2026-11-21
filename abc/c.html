@@ -57,6 +57,8 @@ __def("js/core.js", function (module, exports, require) {
 //     每张图的连弩子弹加起来正好等于格子数，所以一张图清完时传送带、机关匣、下面几列都刚好空了
 
 const CFG = {
+  drop1: 0.25, // 攻防组装：一种颜色打掉几成掉第一个零件
+  drop2: 0.6, // 打掉几成掉第二个
   lapSec: 6, // 照做版：传送带一圈几秒（原作约 6 秒）。速度 = 一圈格数 / lapSec
   perLane: 1, // 照做版：每条线打几发（原作 1 发）
   speed: 18, // 传送带速度：格 / 秒（16×16 的图一圈 76 格，绕一圈约 4.2 秒）
@@ -68,6 +70,17 @@ const CFG = {
   merge: false, // 槽里同色三台合体（照做版关掉）
   rescue: false, // 槽满时刚好凑成三台也算救回来
 };
+
+// —— 攻防组装（2026-11-20 Cc 定：要有「胡不胡」，学《赵云与阿斗》格子有限）——
+// 敌方机关兽某种颜色打掉一半、打光，各掉一个零件，落进和连弩车同一排的槽里（占格子）。
+// 槽里凑齐一张图纸就当场合体出机关；凑不齐就一直占着格子（槽满就输）；不要的点一下扔掉。
+const PARTS = ['head', 'wing', 'arm', 'gear']; // 铜头 木翅 弩臂 齿轮
+const RECIPES = {
+  que: ['head', 'wing', 'wing'], // 铜雀：飞出去吃掉场上剩得最多的那种颜色
+  spin: ['arm', 'arm', 'gear'], // 转射机：上传送带转一圈，什么颜色都打（最外层，一列一发）
+  kite: ['wing', 'gear', 'gear'], // 木鸢：这一关多一个槽
+};
+const SPIN_AMMO = 24;
 
 // 颜色：字母 → 序号。关卡图里用字母画。
 const ORDER = 'ROYGTBPKNWDS'; // 后四个是玩具版加的：N 棕（木头）W 白（蒸汽）D 深（眼睛头发）S 肤色
@@ -225,6 +238,145 @@ function loadStage(g, k) {
   for (let i = 0; i < g.cells.length; i++) if (g.cells[i] >= 0) g.counts[g.cells[i]]++;
   g.stageLeft = cellCount(g.cells);
   g.cols = st.cols.map((c) => c.map((s) => ({ id: g.nextId++, color: s.color, ammo: s.ammo, big: 0 })));
+  if (g.partsOn) assignParts(g);
+}
+
+// 每种颜色掉哪种零件：把几张图纸要的零件排成一串，按颜色发下去（固定种子，同一关每次一样）。
+// ≥20 格的颜色掉两个（打掉一半一个、打光一个），10 格的掉一个。只亮这关凑得出来的图纸。
+function assignParts(g) {
+  const colors = [];
+  g.counts.forEach((n, c) => n > 0 && colors.push(c));
+  const r = rng(g.partSeed || 7);
+  const order = ['que', 'spin', 'kite'].sort(() => r() - 0.5);
+  const pool = [];
+  for (const k of order) pool.push(...RECIPES[k]);
+  // 一色掉两个同样的零件，所以按「两个一样」配对：先给需要成对的（翅、臂、齿轮），再给单个的
+  g.partOf = {};
+  g.drops = {};
+  g.init = g.counts.slice();
+  colors.sort((a, b) => g.counts[b] - g.counts[a]);
+  const pairs = [];
+  const singles = [];
+  const need = {};
+  for (const k of order) for (const p of RECIPES[k]) need[p] = (need[p] || 0) + 1;
+  for (const p of PARTS) {
+    let n = need[p] || 0;
+    while (n >= 2) { pairs.push(p); n -= 2; }
+    if (n) singles.push(p);
+  }
+  let pi = 0, si = 0;
+  for (const c of colors) {
+    const two = g.counts[c] >= 20;
+    if (two && pi < pairs.length) g.partOf[c] = pairs[pi++];
+    else if (si < singles.length) g.partOf[c] = singles[si++];
+    else if (pi < pairs.length) g.partOf[c] = pairs[pi++];
+    else g.partOf[c] = PARTS[Math.floor(r() * PARTS.length)];
+    g.drops[c] = 0;
+  }
+  // 这关一共会掉哪些零件 → 只亮凑得出来的图纸（最多 3 张）
+  const total = {};
+  for (const c of colors) total[g.partOf[c]] = (total[g.partOf[c]] || 0) + (g.counts[c] >= 20 ? 2 : 1);
+  g.recipes = Object.keys(RECIPES).filter((k) => {
+    const want = {};
+    for (const p of RECIPES[k]) want[p] = (want[p] || 0) + 1;
+    return Object.keys(want).every((p) => (total[p] || 0) >= want[p]);
+  });
+  g.huCount = 0;
+}
+
+// 打掉格子后：看这种颜色该不该掉零件
+function partCheck(g, color, idx) {
+  if (!g.partsOn || g.partOf[color] === undefined) return;
+  const n0 = g.init[color];
+  const done = 1 - g.counts[color] / n0; // 这种颜色打掉了几成
+  // 掉得早一点，胡了才有用：≥20 格的打掉 25% 掉第一个、60% 掉第二个；10 格的打掉一半掉一个
+  const want = n0 >= 20 ? (done >= CFG.drop2 ? 2 : done >= CFG.drop1 ? 1 : 0) : done >= 0.5 ? 1 : 0;
+  while (g.drops[color] < want) {
+    g.drops[color]++;
+    dropPart(g, g.partOf[color], idx);
+  }
+}
+
+function dropPart(g, part, idx) {
+  const free = g.slots.indexOf(null);
+  if (free < 0) {
+    // 槽满了：零件掉不进来，碎掉（零件本身不会让你输，输的是连弩车回不来）
+    g.events.push({ type: 'partLost', part, idx });
+    return;
+  }
+  const pc = { id: g.nextId++, part, color: -1, ammo: 0, big: 0 };
+  g.slots[free] = pc;
+  g.events.push({ type: 'part', at: free, part, idx, sh: pc });
+  huCheck(g);
+}
+
+// 槽里凑齐一张图纸 → 合体
+function huCheck(g) {
+  for (const k of g.recipes || []) {
+    const use = [];
+    const ok = RECIPES[k].every((p) => {
+      const i = g.slots.findIndex((s, j) => s && s.part === p && !use.includes(j));
+      if (i < 0) return false;
+      use.push(i);
+      return true;
+    });
+    if (!ok) continue;
+    for (const i of use) g.slots[i] = null;
+    g.huCount++;
+    g.events.push({ type: 'hu', recipe: k, from: use });
+    // 机关的效果放到下一帧开头再做：这时候可能正在遍历传送带，当场改传送带会出错
+    (g.pending || (g.pending = [])).push(k);
+    return;
+  }
+}
+
+function applyMachine(g, k) {
+  {
+    if (k === 'que') machineQue(g);
+    else if (k === 'spin') {
+      const sp = { id: g.nextId++, color: -2, ammo: SPIN_AMMO, big: 1, spin: true, s: 0, lane: -1, laneDone: false };
+      g.belt.push(sp);
+      g.events.push({ type: 'spinIn', sh: sp });
+    } else if (k === 'kite') {
+      g.slots.push(null);
+      g.events.push({ type: 'kiteSlot', at: g.slots.length - 1 });
+    }
+  }
+}
+
+// 铜雀：吃掉场上剩得最多的那种颜色
+function machineQue(g) {
+  let best = -1;
+  g.counts.forEach((n, c) => n > 0 && (best < 0 || n > g.counts[best]) && (best = c));
+  if (best < 0) return;
+  const idxs = [];
+  for (let i = 0; i < g.cells.length; i++) if (g.cells[i] === best) idxs.push(i);
+  for (const i of idxs) {
+    g.cells[i] = -1;
+    g.left--;
+    g.stageLeft--;
+  }
+  g.counts[best] = 0;
+  g.events.push({ type: 'zap', color: best, idxs });
+  colorGone(g, best);
+  if (g.left === 0) {
+    g.status = 'win';
+    g.events.push({ type: 'win' });
+  }
+}
+
+// 一种颜色清光了：所有这种颜色的连弩车都没东西可打了，统统收掉（机关吃掉格子以后会出现这种情况）
+function colorGone(g, c) {
+  g.cols.forEach((col, i) => {
+    g.cols[i] = col.filter((s) => s.color !== c);
+  });
+  g.slots.forEach((s, i) => s && s.color === c && !s.part && (g.slots[i] = null));
+  for (const list of [g.belt, g.entering])
+    for (let i = list.length - 1; i >= 0; i--)
+      if (list[i].color === c) {
+        g.events.push({ type: 'empty', sh: list[i] });
+        list.splice(i, 1);
+      }
 }
 
 function createGame(level, opts) {
@@ -258,6 +410,8 @@ function createGame(level, opts) {
     dog: !!opts.dog,
     events: [],
     taps: 0,
+    partsOn: !!level.parts,
+    partSeed: level.partSeed || 7,
   };
   loadStage(g, 0);
   return g;
@@ -295,6 +449,12 @@ function tapColumn(g, i) {
 function tapSlot(g, i) {
   const s = g.slots[i];
   if (!s) return false;
+  if (s.part) {
+    // 不要的零件：扔进熔炉，格子空出来
+    g.slots[i] = null;
+    g.events.push({ type: 'scrap', at: i, part: s.part, sh: s });
+    return true;
+  }
   if (!canLaunch(g)) {
     g.events.push({ type: 'beltFull' });
     return false;
@@ -388,6 +548,12 @@ function step(g, dt) {
     }
     return;
   }
+  // 上一帧凑齐的图纸、清光的颜色：在这里统一处理（不在遍历传送带时改它）
+  while (g.gone && g.gone.length) colorGone(g, g.gone.shift());
+  while (g.pending && g.pending.length) {
+    applyMachine(g, g.pending.shift());
+    if (g.status !== 'play') return;
+  }
   // 排队的连弩：前面那台走开 gap 格才上
   if (g.entering.length) {
     let minS = Infinity;
@@ -397,6 +563,13 @@ function step(g, dt) {
   for (let i = 0; i < g.belt.length; i++) {
     const s = g.belt[i];
     s.s += g.speed * dt;
+    if (s.s >= g.L && s.spin) {
+      // 转射机转完一圈就散掉，不回槽
+      g.belt.splice(i, 1);
+      i--;
+      g.events.push({ type: 'empty', sh: s });
+      continue;
+    }
     if (s.s >= g.L) {
       if (g.dog && s.big && !s.extra) {
         s.s -= g.L;
@@ -418,6 +591,35 @@ function step(g, dt) {
       s.laneDone = false;
     }
     if (s.laneDone) continue; // 这条线吃过了
+    if (s.spin) {
+      // 转射机：这条线最外面那格，什么颜色都打
+      const idx = firstInLane(g.cells, g.w, g.h, ln.dir, ln.k);
+      if (idx < 0) continue;
+      s.laneDone = true;
+      const c = g.cells[idx];
+      g.cells[idx] = -1;
+      g.left--;
+      g.stageLeft--;
+      g.counts[c]--;
+      s.ammo--;
+      g.events.push({ type: 'shot', idx, color: c, sh: s, k: 0, n: 1 });
+      if (g.counts[c] === 0) {
+        g.events.push({ type: 'colorClear', color: c, n: 1 });
+        (g.gone || (g.gone = [])).push(c); // 下一帧开头再收掉这种颜色的连弩车
+      }
+      partCheck(g, c, idx);
+      if (s.ammo <= 0) {
+        g.belt.splice(i, 1);
+        i--;
+        g.events.push({ type: 'empty', sh: s });
+      }
+      if (g.left === 0) {
+        g.status = 'win';
+        g.events.push({ type: 'win' });
+        return;
+      }
+      continue;
+    }
     const run = laneRun(g.cells, g.w, g.h, ln.dir, ln.k, s.color, Math.min(s.ammo, CFG.perLane || s.ammo), CFG.pierce && s.big > 0);
     if (!run.length) continue; // 最外面不是同色：还在这条线上就接着等（别的连弩可能马上把外层剥掉）
     // 一口气吃掉这一串：规则上同一帧就清掉，画面按 k 一格格错开飞子弹（哒哒哒）
@@ -432,6 +634,8 @@ function step(g, dt) {
       g.events.push({ type: 'shot', idx, color: s.color, sh: s, k, n: run.length });
     }
     if (g.counts[s.color] === 0) g.events.push({ type: 'colorClear', color: s.color, n: run.length });
+    partCheck(g, s.color, run[run.length - 1]);
+    if (g.status !== 'play') return;
     if (s.ammo <= 0) {
       g.belt.splice(i, 1);
       i--;
@@ -483,7 +687,7 @@ function botPick(g, rnd, noise) {
   if (!canLaunch(g)) return null;
   const cands = [];
   g.cols.forEach((c, i) => c.length && cands.push({ kind: 'col', i, s: c[0] }));
-  g.slots.forEach((s, i) => s && cands.push({ kind: 'slot', i, s }));
+  g.slots.forEach((s, i) => s && !s.part && cands.push({ kind: 'slot', i, s }));
   if (!cands.length) return null;
   const scratch = new Int8Array(g.cells.length);
   let best = null;
@@ -511,6 +715,38 @@ function botPick(g, rnd, noise) {
   return dig || cands[0];
 }
 
+// 机器人怎么处理零件：scrap = 一来就扔（不赌）；keep = 留着凑图纸，只剩 minFree 个空格时扔掉最没用的
+function botParts(g, policy, minFree) {
+  if (!g.partsOn) return;
+  const idx = [];
+  g.slots.forEach((s, i) => s && s.part && idx.push(i));
+  if (!idx.length) return;
+  if (policy === 'scrap') {
+    for (const i of idx) tapSlot(g, i);
+    return;
+  }
+  // 还差最少的那张图纸要的零件留着，其余的在格子紧的时候扔
+  const have = {};
+  for (const i of idx) have[g.slots[i].part] = (have[g.slots[i].part] || 0) + 1;
+  let target = null, best = 9;
+  for (const k of g.recipes) {
+    const want = {};
+    for (const p of RECIPES[k]) want[p] = (want[p] || 0) + 1;
+    let miss = 0;
+    for (const p in want) miss += Math.max(0, want[p] - (have[p] || 0));
+    if (miss < best) { best = miss; target = want; }
+  }
+  const useful = (p) => target && target[p];
+  while (freeSlots(g) < (minFree || 2)) {
+    const list = [];
+    g.slots.forEach((s, i) => s && s.part && list.push(i));
+    if (!list.length) break;
+    const junk = list.find((i) => !useful(g.slots[i].part));
+    tapSlot(g, junk !== undefined ? junk : list[0]);
+  }
+  for (const i of idx) if (g.slots[i] && g.slots[i].part && !useful(g.slots[i].part)) tapSlot(g, i);
+}
+
 function botTap(g, pick) {
   return pick.kind === 'col' ? tapColumn(g, pick.i) : tapSlot(g, pick.i);
 }
@@ -526,6 +762,7 @@ function simulate(level, seed, opt) {
   while (g.status === 'play' && g.time < (opt.maxTime || 600)) {
     wait -= dt;
     if (wait <= 0) {
+      botParts(g, opt.parts || 'keep', opt.minFree);
       const p = botPick(g, r, noise);
       if (p) {
         botTap(g, p);
@@ -535,7 +772,7 @@ function simulate(level, seed, opt) {
     step(g, dt);
     g.events.length = 0;
   }
-  return { win: g.status === 'win', time: g.time, left: g.left, total: g.total, taps: g.taps, free: freeSlots(g) };
+  return { win: g.status === 'win', time: g.time, left: g.left, total: g.total, taps: g.taps, free: freeSlots(g), hu: g.huCount || 0 };
 }
 
 // 闭眼乱点：能点就随便点一台（用来查「会玩和乱点差多少」，差得少 = 选择不重要 = 不好玩）
@@ -550,7 +787,7 @@ function simulateRandom(level, seed, opt) {
     if (wait <= 0 && canLaunch(g)) {
       const c = [];
       g.cols.forEach((x, i) => x.length && c.push({ kind: 'col', i }));
-      g.slots.forEach((x, i) => x && c.push({ kind: 'slot', i }));
+      g.slots.forEach((x, i) => x && c.push({ kind: 'slot', i })); // 乱点：零件也会被点到（= 扔掉）
       if (c.length) botTap(g, c[Math.floor(r() * c.length)]);
       wait = (opt.react || 0.6) * (0.6 + r() * 0.8);
     }
@@ -719,7 +956,7 @@ function buildLevel(def, seed) {
   const stages = arts.map((a, k) => buildStage(a, def, seed + k * 7777));
   const first = stages[0];
   for (const st of stages) if (st.w !== first.w || st.h !== first.h) throw new Error(def.name + '：一关里几张图要一样大');
-  return { w: first.w, h: first.h, cells: first.cells, cols: first.cols, slots: def.slots || 5, stages: stages.map((st) => ({ cells: st.cells, cols: st.cols })) };
+  return { w: first.w, h: first.h, cells: first.cells, cols: first.cols, slots: def.slots || 5, parts: !!def.parts, partSeed: seed, stages: stages.map((st) => ({ cells: st.cells, cols: st.cols })) };
 }
 
 module.exports = {
@@ -749,6 +986,9 @@ module.exports = {
   simulateRandom,
   buildLevel,
   round10,
+  PARTS,
+  RECIPES,
+  botParts,
 };
 
 });
@@ -1743,8 +1983,10 @@ const LEVELS = [
   { name: '骨头·二', art: pad(ART['骨头'], 'Y', []), cols: 3, chunks: [20, 30, 40], bury: -1.5 },
   { name: '工具箱·二', art: pad(ART['工具箱'], 'G', ['B', 'K']), cols: 3, chunks: [10, 20, 30, 40], bury: 0.3, mystery: true, hard: true },
   { name: '汐娘·二', art: pad(ART['汐娘'], 'O', ['R', 'G', 'B']), cols: 4, chunks: [20, 40], hard: true, tune: { head: 0.6, bury: 0.15 } },
-].map((d) => {
-  const o = Object.assign({}, BASE, d);
+].map((d, i) => {
+  // 攻防组装：从第 4 关开始（第 4 关先弹「机关图纸」卡片），之前几关只教点连弩车
+  const o = Object.assign({}, BASE, d, i >= 3 ? { parts: true } : {});
+  if (i === 3) o.intro = 'parts';
   // 难关、中等关：只有开头一小段按「外层先」排，其余照出关规则把里层颜色往前放
   if (d.hard) Object.assign(o, { head: 0.3, bury: 0.7 });
   else if (d.mid) Object.assign(o, { head: 0.5, bury: 0.3 });
@@ -1857,7 +2099,8 @@ function layout(w, h) {
   const top = Math.max(10, scr.safeTop + 6);
   const barH = 40;
   // 横向一共要放：棋盘 w 格 + 两边各（传送带离棋盘 o 格 + 连弩半径 + 一点边）≈ (w + 3.4) 格 + 26 像素
-  const cs = Math.max(8, Math.floor(Math.min((W - 34) / (w + 3.4), (H * 0.52 - 26) / (h + 3.4))));
+  const strip = S.def && S.def.parts ? 44 : 0; // 攻防组装：传送带和槽之间留一条放图纸
+  const cs = Math.max(8, Math.floor(Math.min((W - 34) / (w + 3.4), (H * 0.52 - 26 - strip) / (h + 3.4))));
   const cartR = Math.max(9, Math.round(cs * 0.85));
   const o = (cartR + 9) / cs; // 传送带中线离棋盘几格：连弩不压到铜框
   const bw = cs * w;
@@ -1866,9 +2109,10 @@ function layout(w, h) {
   const by = Math.round(top + barH + o * cs + cartR + 8);
   const beltBottom = by + bh + o * cs;
   const slotR = Math.min(22, Math.max(16, W / 20));
-  const slotY = beltBottom + cartR + slotR + 26;
+  const stripY = beltBottom + cartR + 8 + strip / 2;
+  const slotY = beltBottom + cartR + slotR + 26 + strip;
   const colTop = slotY + slotR + 18;
-  return { top, barH, o, cs, bw, bh, bx, by, cartR, slotR, slotY, colTop, beltBottom };
+  return { top, barH, o, cs, bw, bh, bx, by, cartR, slotR, slotY, colTop, beltBottom, strip, stripY };
 }
 
 function slotPos(i, n) {
@@ -1959,6 +2203,9 @@ function startLevel() {
   S.stats.lastEnd = null;
   S.roundStart = S.time;
   S.tip2 = 0;
+  S.huText = null;
+  S.huFlash = null;
+  S.birdFly = null;
   // 照做版：新机制那关先弹一张卡片（原作第 8 关：问号炮台）；难关开局提示一下
   S.card = null;
   S.toast = null;
@@ -2169,6 +2416,76 @@ function onEvent(e) {
       S.beltFlash = 0.5;
       P.sound('nope', 0.5);
       break;
+    // —— 攻防组装 ——
+    case 'part': {
+      // 零件从打掉的那格飞进槽里
+      const from = cellCenter(e.idx);
+      e.sh.from = from;
+      e.sh.flyT = -0.15; // 先在原地亮一下再飞
+      S.rings.push({ x: from.x, y: from.y, r0: 6, r1: 30, t: 0, dur: 0.3, color: '#ffd27a' });
+      P.sound('slot', 0.7);
+      P.vibrate(false);
+      break;
+    }
+    case 'partLost': {
+      const from = cellCenter(e.idx);
+      S.floaters.push({ x: from.x, y: from.y - 10, text: '槽满了', t: 0 });
+      P.sound('nope', 0.4);
+      break;
+    }
+    case 'scrap': {
+      const p = slotPos(e.at, g.slots.length);
+      for (let i = 0; i < 10; i++) {
+        const a = Math.random() * Math.PI * 2;
+        S.parts.push({ x: p.x, y: p.y, vx: Math.cos(a) * 70, vy: Math.sin(a) * 70 - 50, life: 0.5, max: 0.5, color: '#8a7a70', size: 6, soft: true });
+      }
+      P.sound('empty', 0.5);
+      break;
+    }
+    case 'hu': {
+      // 胡了：零件从槽里飞向图纸，白闪、顿帧、大字
+      const to = (S.recipePos && S.recipePos[e.recipe]) || { x: W / 2, y: S.L.stripY };
+      e.from.forEach((fi, j) => {
+        const f = slotPos(fi, g.slots.length);
+        S.ghosts.push({ x0: f.x, y0: f.y, x1: to.x, y1: to.y, t: 0, dur: 0.25, part: core.RECIPES[e.recipe][j] });
+      });
+      S.huFlash = { k: e.recipe, t: 1 };
+      S.huText = { str: MACHINE_NAME[e.recipe] + '！', sub: e.recipe === 'que' ? '吃掉一整种颜色' : e.recipe === 'spin' ? '转一圈，什么颜色都打' : '多一个槽', t: 0 };
+      S.hitstop = 0.12;
+      S.shake = Math.max(S.shake, 10);
+      S.flash = Math.max(S.flash, 0.6);
+      S.rings.push({ x: to.x, y: to.y, r0: 10, r1: W * 0.6, t: 0, dur: 0.5, color: '#ffe38a', w: 8 });
+      P.sound('merge', 0.9);
+      P.vibrate(true);
+      break;
+    }
+    case 'zap': {
+      // 铜雀：从图纸那边飞上棋盘，一路把这种颜色啄光
+      const L = S.L;
+      const o = { x: W / 2, y: L.by + L.bh + 10 };
+      S.birdFly = { t: 0, dur: 0.9, x0: -40, y0: L.by + L.bh * 0.7, x1: W + 40, y1: L.by + L.bh * 0.2 };
+      e.idxs.forEach((idx, n) => {
+        const to = cellCenter(idx);
+        S.bullets.push({ sh: null, origin: o, x0: 0, y0: 0, x1: to.x, y1: to.y, t: -0.05 - n * (0.6 / Math.max(1, e.idxs.length)), dur: 0.12, color: e.color, idx, k: 0, n: 1, pitch: n % 12, started: false });
+      });
+      S.rings.push({ x: L.bx + L.bw / 2, y: L.by + L.bh / 2, r0: 20, r1: L.bw, t: 0.2, dur: 0.6, color: COL[e.color].light, w: 10 });
+      P.sound('clear', 0.9);
+      break;
+    }
+    case 'spinIn': {
+      const p = beltXY(0);
+      S.rings.push({ x: p.x, y: p.y, r0: 10, r1: 60, t: 0, dur: 0.4, color: '#fff1c8', w: 6 });
+      P.sound('launch', 0.8);
+      break;
+    }
+    case 'kiteSlot': {
+      setTimeout0(() => {
+        const p = slotPos(e.at, g.slots.length);
+        S.rings.push({ x: p.x, y: p.y, r0: 6, r1: 50, t: 0, dur: 0.45, color: '#c98f55', w: 6 });
+        P.sound('pet', 0.7);
+      }, 200);
+      break;
+    }
   }
 }
 
@@ -2208,6 +2525,14 @@ function update(dt) {
     if (S.toast.t <= 0) S.toast = null;
   }
   if (S.tip2 > 0) S.tip2 -= dt;
+  if (S.huText) {
+    S.huText.t += dt;
+    if (S.huText.t > 1.3) S.huText = null;
+  }
+  if (S.huFlash) {
+    S.huFlash.t -= dt * 1.5;
+    if (S.huFlash.t <= 0) S.huFlash = null;
+  }
   if (S.ad) {
     S.ad.t -= dt;
     if (S.ad.t <= 0) {
@@ -2225,9 +2550,14 @@ function update(dt) {
     if (b.t < 0) continue; // 还没轮到这一发
     if (!b.started) {
       b.started = true;
-      const from = beltXY(b.sh.s);
-      b.x0 = from.x + Math.cos(from.ang) * S.L.cartR;
-      b.y0 = from.y + Math.sin(from.ang) * S.L.cartR;
+      if (b.origin) {
+        b.x0 = b.origin.x;
+        b.y0 = b.origin.y;
+      } else {
+        const from = beltXY(b.sh.s);
+        b.x0 = from.x + Math.cos(from.ang) * S.L.cartR;
+        b.y0 = from.y + Math.sin(from.ang) * S.L.cartR;
+      }
     }
     if (b.t >= b.dur) {
       S.bullets.splice(i, 1);
@@ -2244,6 +2574,10 @@ function update(dt) {
     p.x += p.vx * dt;
     p.y += p.vy * dt;
     p.vy += (p.soft ? -20 : 420) * dt;
+  }
+  if (S.birdFly) {
+    S.birdFly.t += dt;
+    if (S.birdFly.t > S.birdFly.dur) S.birdFly = null;
   }
   for (const list of [S.rings, S.ghosts, S.floaters]) {
     for (let i = list.length - 1; i >= 0; i--) {
@@ -2443,8 +2777,13 @@ function coinIcon(x, y, r) {
 
 // 一台蒸汽连弩车
 const HIDDEN = { base: '#6d6670', light: '#9a929c', dark: '#4a444d' };
+const SPIN = { base: '#fff1c8', light: '#ffffff', dark: '#d9a441' };
 function drawShooter(x, y, r, sh, ang, alpha) {
-  const k = sh.hidden ? HIDDEN : COL[sh.color];
+  if (sh.part) {
+    drawPart(x, y, r, sh.part, alpha);
+    return;
+  }
+  const k = sh.hidden ? HIDDEN : sh.spin ? SPIN : COL[sh.color];
   const big = sh.big || 0;
   r *= 1 + 0.16 * big;
   if (sh.popT !== undefined && sh.popT < 0.3) r *= 1 + 0.35 * Math.sin((sh.popT / 0.3) * Math.PI);
@@ -2501,7 +2840,7 @@ function drawShooter(x, y, r, sh, ang, alpha) {
   ctx.strokeStyle = k.dark;
   ctx.stroke();
   // 子弹数
-  text(sh.hidden ? '?' : String(sh.ammo), 0, 1, Math.round(r * (sh.ammo >= 100 ? 0.62 : 0.8)), '#fff', 'center', INK);
+  text(sh.hidden ? '?' : sh.spin ? '✦' + sh.ammo : String(sh.ammo), 0, 1, Math.round(r * (sh.ammo >= 100 ? 0.62 : 0.8)), '#fff', 'center', INK);
   ctx.restore();
 }
 
@@ -2746,7 +3085,7 @@ function drawSlots() {
   // 合体时飞过去的两台
   for (const gh of S.ghosts) {
     const t = ease(gh.t / gh.dur);
-    drawShooter(lerp(gh.x0, gh.x1, t), lerp(gh.y0, gh.y1, t), L.slotR * 0.9 * (1 - t * 0.5), { color: gh.color, ammo: '', big: 0 }, undefined, 1 - t * 0.5);
+    drawShooter(lerp(gh.x0, gh.x1, t), lerp(gh.y0, gh.y1, t), L.slotR * 0.9 * (1 - t * 0.5), gh.part ? { part: gh.part } : { color: gh.color, ammo: '', big: 0 }, undefined, 1 - t * 0.5);
   }
   // 槽满了：多出来的那台悬在上面发抖
   if (g.status === 'full' && g.overflow) {
@@ -2805,6 +3144,162 @@ function tipText(str, alpha) {
   ctx.restore();
 }
 
+// —— 攻防组装：零件、图纸、合体 ——
+const PART_NAME = { head: '铜头', wing: '木翅', arm: '弩臂', gear: '齿轮' };
+const MACHINE_NAME = { que: '铜雀', spin: '转射机', kite: '木鸢' };
+// 一个零件：铜底圆盘上画零件的样子（代码画）
+function drawPart(x, y, r, part, alpha, dim) {
+  ctx.save();
+  ctx.globalAlpha = (alpha === undefined ? 1 : alpha) * (dim ? 0.35 : 1);
+  ctx.translate(x, y);
+  rr(-r, -r, r * 2, r * 2, r * 0.35);
+  ctx.fillStyle = '#3b2a22';
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = dim ? '#5a4a40' : BRASS;
+  ctx.stroke();
+  const q = r * 0.62;
+  ctx.lineWidth = Math.max(1.5, r * 0.09);
+  ctx.strokeStyle = INK;
+  if (part === 'head') {
+    // 铜雀的头：圆头 + 尖嘴 + 一只眼
+    circle(-q * 0.1, 0, q * 0.62);
+    ctx.fillStyle = BRASS_L;
+    ctx.fill();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(q * 0.45, -q * 0.15);
+    ctx.lineTo(q * 1.0, q * 0.05);
+    ctx.lineTo(q * 0.45, q * 0.25);
+    ctx.closePath();
+    ctx.fillStyle = '#e07a3a';
+    ctx.fill();
+    ctx.stroke();
+    circle(0, -q * 0.12, q * 0.13);
+    ctx.fillStyle = INK;
+    ctx.fill();
+  } else if (part === 'wing') {
+    // 木翅：三片木羽
+    for (let k = 0; k < 3; k++) {
+      ctx.save();
+      ctx.rotate(-0.5 + k * 0.42);
+      ctx.beginPath();
+      ctx.ellipse(q * 0.15, 0, q * 0.95, q * 0.26, 0, 0, Math.PI * 2);
+      ctx.fillStyle = k === 1 ? '#c98f55' : '#a8703f';
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+    }
+  } else if (part === 'arm') {
+    // 弩臂：一张弓 + 弦 + 一支箭
+    ctx.beginPath();
+    ctx.arc(q * 0.6, 0, q * 1.0, Math.PI * 0.62, Math.PI * 1.38);
+    ctx.strokeStyle = '#8a5a2e';
+    ctx.lineWidth = Math.max(2.5, r * 0.16);
+    ctx.stroke();
+    ctx.lineWidth = 1.2;
+    ctx.strokeStyle = '#f2e6cc';
+    ctx.beginPath();
+    ctx.moveTo(q * 0.6 + Math.cos(Math.PI * 0.62) * q, Math.sin(Math.PI * 0.62) * q);
+    ctx.lineTo(q * 0.6 + Math.cos(Math.PI * 1.38) * q, Math.sin(Math.PI * 1.38) * q);
+    ctx.stroke();
+    ctx.strokeStyle = BRASS_L;
+    ctx.lineWidth = Math.max(1.5, r * 0.08);
+    ctx.beginPath();
+    ctx.moveTo(-q * 0.9, 0);
+    ctx.lineTo(q * 0.9, 0);
+    ctx.stroke();
+  } else {
+    ART.gear(ctx, 0, 0, q * 0.85, 8, BRASS_L, S.time * 0.8, 1.5);
+    circle(0, 0, q * 0.25);
+    ctx.fillStyle = '#3b2a22';
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+// 机关的小图标（图纸左边）
+function drawMachineIcon(x, y, s, k, lit) {
+  ctx.save();
+  ctx.globalAlpha = lit ? 1 : 0.8;
+  if (k === 'que') ART.bird(ctx, x, y, s * 0.55, 0);
+  else if (k === 'spin') {
+    ART.gear(ctx, x, y, s * 0.5, 10, BRASS_L, S.time * (lit ? 4 : 0.6), 1.5);
+    for (let a = 0; a < 4; a++) {
+      const t = (a * Math.PI) / 2 + S.time * (lit ? 4 : 0.6);
+      ctx.strokeStyle = '#8a5a2e';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.moveTo(x + Math.cos(t) * s * 0.3, y + Math.sin(t) * s * 0.3);
+      ctx.lineTo(x + Math.cos(t) * s * 0.62, y + Math.sin(t) * s * 0.62);
+      ctx.stroke();
+    }
+  } else {
+    // 木鸢：一对展开的木翅
+    for (const d of [-1, 1]) {
+      ctx.beginPath();
+      ctx.ellipse(x + d * s * 0.28, y, s * 0.36, s * 0.14, d * -0.35, 0, Math.PI * 2);
+      ctx.fillStyle = '#c98f55';
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = INK;
+      ctx.stroke();
+    }
+    circle(x, y, s * 0.12);
+    ctx.fillStyle = BRASS_L;
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+// 图纸条：每张图纸 = 机关小图 + 三个零件格；槽里已经有的零件亮起来，还差几个一眼看得到
+function drawRecipes() {
+  const L = S.L;
+  const g = S.g;
+  if (!g.partsOn || !g.recipes || !g.recipes.length) return;
+  const n = g.recipes.length;
+  const cw = Math.min(124, (W - 16) / n - 6);
+  const ch = 38;
+  const have = {};
+  g.slots.forEach((s) => s && s.part && (have[s.part] = (have[s.part] || 0) + 1));
+  S.recipePos = {};
+  g.recipes.forEach((k, i) => {
+    const x0 = W / 2 + (i - (n - 1) / 2) * (cw + 6) - cw / 2;
+    const y0 = L.stripY - ch / 2;
+    const want = core.RECIPES[k];
+    const left = Object.assign({}, have);
+    const got = want.map((p) => (left[p] > 0 ? (left[p]--, true) : false));
+    const nGot = got.filter(Boolean).length;
+    const ready = nGot === want.length - 1; // 「听牌」：只差一个
+    const flash = S.huFlash && S.huFlash.k === k ? S.huFlash.t : 0;
+    rr(x0, y0, cw, ch, 10);
+    ctx.fillStyle = flash > 0 ? 'rgba(255,230,160,' + (0.25 + flash) + ')' : ready ? 'rgba(120,70,30,0.85)' : 'rgba(30,20,26,0.85)';
+    ctx.fill();
+    ctx.lineWidth = ready ? 2.5 : 1.5;
+    ctx.strokeStyle = ready && Math.floor(S.time * 4) % 2 === 0 ? '#ffd27a' : BRASS_D;
+    ctx.stroke();
+    drawMachineIcon(x0 + 18, y0 + ch / 2, 30, k, ready);
+    const pr = Math.min(12, (cw - 40) / 6.4);
+    want.forEach((p, j) => drawPart(x0 + 40 + pr + j * (pr * 2 + 4), y0 + ch / 2, pr, p, 1, !got[j]));
+    S.recipePos[k] = { x: x0 + cw / 2, y: y0 + ch / 2 };
+  });
+}
+
+function drawHuText() {
+  const h = S.huText;
+  if (!h) return;
+  const t = h.t;
+  const s = t < 0.15 ? 0.6 + (t / 0.15) * 0.6 : t < 0.3 ? 1.2 - ((t - 0.15) / 0.15) * 0.2 : 1;
+  const a = t > 1.0 ? Math.max(0, 1 - (t - 1.0) / 0.3) : 1;
+  ctx.save();
+  ctx.globalAlpha = a;
+  ctx.translate(W / 2, S.L.by + S.L.bh * 0.42);
+  ctx.scale(s, s);
+  text(h.str, 0, 0, 44, '#ffe38a', 'center', INK);
+  text(h.sub, 0, 40, 16, '#fff3c4', 'center', INK);
+  ctx.restore();
+}
+
 // 新机制卡片（原作：整屏一张卡 + 大图 + 一句话 + 按钮）
 function drawCard() {
   const c = S.card;
@@ -2821,12 +3316,24 @@ function drawCard() {
   ctx.strokeStyle = BRASS;
   ctx.stroke();
   text('新东西', W / 2, y0 + 32, 16, BRASS_L);
-  text('问号连弩', W / 2, y0 + 66, 26, '#fff3c4');
-  // 一台露脸的 + 两台问号
-  drawShooter(W / 2 - 70, y0 + 142, 30, { color: 4, ammo: 10, big: 0 });
-  drawShooter(W / 2, y0 + 142, 26, { color: 0, ammo: 0, big: 0, hidden: true });
-  drawShooter(W / 2 + 70, y0 + 142, 26, { color: 0, ammo: 0, big: 0, hidden: true });
-  text('排到最前面才翻开颜色', W / 2, y0 + 202, 16, '#e8dcc8');
+  if (c.kind === 'parts') {
+    text('机关图纸', W / 2, y0 + 66, 26, '#fff3c4');
+    // 三个零件 → 一只铜雀
+    drawPart(W / 2 - 104, y0 + 132, 20, 'head');
+    drawPart(W / 2 - 58, y0 + 132, 20, 'wing');
+    drawPart(W / 2 - 12, y0 + 132, 20, 'wing');
+    text('→', W / 2 + 28, y0 + 133, 26, BRASS_L);
+    drawMachineIcon(W / 2 + 84, y0 + 132, 64, 'que', true);
+    text('打掉的零件落进槽里，凑齐一张就合体', W / 2, y0 + 184, 15, '#e8dcc8');
+    text('零件占格子；不要的点一下扔掉', W / 2, y0 + 208, 15, '#e8dcc8');
+  } else {
+    text('问号连弩', W / 2, y0 + 66, 26, '#fff3c4');
+    // 一台露脸的 + 两台问号
+    drawShooter(W / 2 - 70, y0 + 142, 30, { color: 4, ammo: 10, big: 0 });
+    drawShooter(W / 2, y0 + 142, 26, { color: 0, ammo: 0, big: 0, hidden: true });
+    drawShooter(W / 2 + 70, y0 + 142, 26, { color: 0, ammo: 0, big: 0, hidden: true });
+    text('排到最前面才翻开颜色', W / 2, y0 + 202, 16, '#e8dcc8');
+  }
   const bw = 160, bh = 48, bx = W / 2 - bw / 2, by = y0 + ch - 70;
   rr(bx, by, bw, bh, 24);
   ctx.fillStyle = BRASS;
@@ -2918,9 +3425,16 @@ function drawFx() {
   for (const f of S.floaters) {
     const t = f.t / 0.9;
     ctx.globalAlpha = 1 - t;
-    petIcon(f.pet, f.x, f.y - t * 30, 26);
+    if (f.text) text(f.text, f.x, f.y - t * 30, 14, '#ff8a7a', 'center', INK);
+    else petIcon(f.pet, f.x, f.y - t * 30, 26);
   }
   ctx.globalAlpha = 1;
+  // 铜雀飞过棋盘
+  if (S.birdFly) {
+    const b = S.birdFly;
+    const t = Math.min(1, b.t / b.dur);
+    ART.bird(ctx, lerp(b.x0, b.x1, t), lerp(b.y0, b.y1, t) - Math.sin(t * Math.PI) * 30, 34, -0.2);
+  }
 }
 
 function petIcon(id, x, y, s) {
@@ -3251,10 +3765,12 @@ function render() {
   if (S.shake > 0) ctx.translate((Math.random() - 0.5) * S.shake, (Math.random() - 0.5) * S.shake);
   drawBelt();
   drawBoard();
+  drawRecipes();
   drawSlots();
   drawColumns();
   drawFx();
   ctx.restore();
+  drawHuText();
   drawCombo();
   drawTopBar();
   if (S.flash > 0) {
