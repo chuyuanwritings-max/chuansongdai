@@ -72,8 +72,10 @@ const CFG = {
 };
 
 // —— 攻防组装（2026-11-20 Cc 定：要有「胡不胡」，学《赵云与阿斗》格子有限）——
-// 敌方机关兽某种颜色打掉一半、打光，各掉一个零件，落进和连弩车同一排的槽里（占格子）。
-// 槽里凑齐一张图纸就当场合体出机关；凑不齐就一直占着格子（槽满就输）；不要的点一下扔掉。
+// 11-21 Cc：「凑道具完全没意义……跟游戏没互动，瞎点一通」→ 改成每一步都要玩家出手：
+//   - 零件挂在连弩车头上（看得见）。这台打光弹药，零件才掉进槽里 → 先放哪台 = 选要哪个零件
+//   - 零件和连弩车抢同样的格子；凑齐一张图纸 → 合成一个机关，存成按钮（不自动放）
+//   - 机关自己点着放：铜雀（再点一种颜色，吃光它）、转射机（上传送带什么颜色都打）、木鸢（多一个槽；槽满输了也能用来救）
 const PARTS = ['head', 'wing', 'arm', 'gear']; // 铜头 木翅 弩臂 齿轮
 const RECIPES = {
   que: ['head', 'wing', 'wing'], // 铜雀：飞出去吃掉场上剩得最多的那种颜色
@@ -244,48 +246,36 @@ function loadStage(g, k) {
 // 每种颜色掉哪种零件：把几张图纸要的零件排成一串，按颜色发下去（固定种子，同一关每次一样）。
 // ≥20 格的颜色掉两个（打掉一半一个、打光一个），10 格的掉一个。只亮这关凑得出来的图纸。
 function assignParts(g) {
-  const colors = [];
-  g.counts.forEach((n, c) => n > 0 && colors.push(c));
+  // 11-21 改：先定这关亮几张图纸（第 4–7 关 1 张、第 8 关起 2 张、难关 3 张），
+  // 再把这些图纸要的零件挂到连弩车头上：从前往后、各列轮着挂，保证一定凑得齐。
   const r = rng(g.partSeed || 7);
   const order = ['que', 'spin', 'kite'].sort(() => r() - 0.5);
-  const pool = [];
-  for (const k of order) pool.push(...RECIPES[k]);
-  // 一色掉两个同样的零件，所以按「两个一样」配对：先给需要成对的（翅、臂、齿轮），再给单个的
+  g.recipes = order.slice(0, Math.max(1, Math.min(3, g.recipeN || 1)));
+  const list = [];
+  g.cols.forEach((col, ci) => col.forEach((sh, j) => list.push({ sh, ci, j })));
+  list.sort((a, b) => a.j - b.j || a.sh.ammo - b.sh.ammo || a.ci - b.ci); // 同一排里先挂弹药少的（早打完、零件早掉）
+  // 第一张图纸的零件从第一排就开始挂（教得会）；后面几张往后挪一排（要先把前面的车放掉才够得着）
+  let at = 0;
+  g.recipes.forEach((k, n) => {
+    if (n > 0) at = Math.max(at, Math.min(list.length - 1, g.cols.length * n));
+    for (const p of RECIPES[k]) {
+      while (at < list.length && list[at].sh.carry) at++;
+      if (at >= list.length) break;
+      list[at].sh.carry = p; // carry = 车头顶着的零件（槽里的零件用 part）
+      at++;
+    }
+  });
   g.partOf = {};
   g.drops = {};
   g.init = g.counts.slice();
-  colors.sort((a, b) => g.counts[b] - g.counts[a]);
-  const pairs = [];
-  const singles = [];
-  const need = {};
-  for (const k of order) for (const p of RECIPES[k]) need[p] = (need[p] || 0) + 1;
-  for (const p of PARTS) {
-    let n = need[p] || 0;
-    while (n >= 2) { pairs.push(p); n -= 2; }
-    if (n) singles.push(p);
-  }
-  let pi = 0, si = 0;
-  for (const c of colors) {
-    const two = g.counts[c] >= 20;
-    if (two && pi < pairs.length) g.partOf[c] = pairs[pi++];
-    else if (si < singles.length) g.partOf[c] = singles[si++];
-    else if (pi < pairs.length) g.partOf[c] = pairs[pi++];
-    else g.partOf[c] = PARTS[Math.floor(r() * PARTS.length)];
-    g.drops[c] = 0;
-  }
-  // 这关一共会掉哪些零件 → 只亮凑得出来的图纸（最多 3 张）
-  const total = {};
-  for (const c of colors) total[g.partOf[c]] = (total[g.partOf[c]] || 0) + (g.counts[c] >= 20 ? 2 : 1);
-  g.recipes = Object.keys(RECIPES).filter((k) => {
-    const want = {};
-    for (const p of RECIPES[k]) want[p] = (want[p] || 0) + 1;
-    return Object.keys(want).every((p) => (total[p] || 0) >= want[p]);
-  });
   g.huCount = 0;
+  g.tools = { que: 0, spin: 0, kite: 0 };
 }
 
 // 打掉格子后：看这种颜色该不该掉零件
 function partCheck(g, color, idx) {
+  return; // 11-21 起零件改成挂在连弩车上（打光弹药才掉），不再按颜色进度掉
+  // eslint-disable-next-line no-unreachable
   if (!g.partsOn || g.partOf[color] === undefined) return;
   const n0 = g.init[color];
   const done = 1 - g.counts[color] / n0; // 这种颜色打掉了几成
@@ -297,7 +287,7 @@ function partCheck(g, color, idx) {
   }
 }
 
-function dropPart(g, part, idx) {
+function dropPart(g, part, idx, from) {
   const free = g.slots.indexOf(null);
   if (free < 0) {
     // 槽满了：零件掉不进来，碎掉（零件本身不会让你输，输的是连弩车回不来）
@@ -306,7 +296,7 @@ function dropPart(g, part, idx) {
   }
   const pc = { id: g.nextId++, part, color: -1, ammo: 0, big: 0 };
   g.slots[free] = pc;
-  g.events.push({ type: 'part', at: free, part, idx, sh: pc });
+  g.events.push({ type: 'part', at: free, part, idx, sh: pc, from: from || null });
   huCheck(g);
 }
 
@@ -323,9 +313,8 @@ function huCheck(g) {
     if (!ok) continue;
     for (const i of use) g.slots[i] = null;
     g.huCount++;
+    g.tools[k]++;
     g.events.push({ type: 'hu', recipe: k, from: use });
-    // 机关的效果放到下一帧开头再做：这时候可能正在遍历传送带，当场改传送带会出错
-    (g.pending || (g.pending = [])).push(k);
     return;
   }
 }
@@ -344,10 +333,35 @@ function applyMachine(g, k) {
   }
 }
 
-// 铜雀：吃掉场上剩得最多的那种颜色
-function machineQue(g) {
-  let best = -1;
-  g.counts.forEach((n, c) => n > 0 && (best < 0 || n > g.counts[best]) && (best = c));
+// 玩家点机关按钮：铜雀要再给一个颜色；木鸢在槽满输掉时也能用（多一格，把回不来的那台放进去）
+function useTool(g, k, color) {
+  if (!g.tools || !(g.tools[k] > 0)) return false;
+  if (k === 'kite' && g.status === 'full') {
+    g.tools.kite--;
+    g.slots.push(g.overflow);
+    g.events.push({ type: 'kiteSlot', at: g.slots.length - 1, rescue: true });
+    g.overflow = null;
+    g.status = 'play';
+    return true;
+  }
+  if (g.status !== 'play') return false;
+  if (k === 'que') {
+    if (color === undefined || !(g.counts[color] > 0)) return false;
+    g.tools.que--;
+    g.events.push({ type: 'useTool', tool: k, color });
+    machineQue(g, color);
+    return true;
+  }
+  g.tools[k]--;
+  g.events.push({ type: 'useTool', tool: k });
+  (g.pending || (g.pending = [])).push(k);
+  return true;
+}
+
+// 铜雀：吃掉一整种颜色（玩家点的那种；没给就挑剩得最多的）
+function machineQue(g, pick) {
+  let best = pick !== undefined && g.counts[pick] > 0 ? pick : -1;
+  if (best < 0) g.counts.forEach((n, c) => n > 0 && (best < 0 || n > g.counts[best]) && (best = c));
   if (best < 0) return;
   const idxs = [];
   for (let i = 0; i < g.cells.length; i++) if (g.cells[i] === best) idxs.push(i);
@@ -367,16 +381,26 @@ function machineQue(g) {
 
 // 一种颜色清光了：所有这种颜色的连弩车都没东西可打了，统统收掉（机关吃掉格子以后会出现这种情况）
 function colorGone(g, c) {
+  const carried = [];
   g.cols.forEach((col, i) => {
+    col.forEach((s) => s.color === c && s.carry && carried.push(s));
     g.cols[i] = col.filter((s) => s.color !== c);
   });
-  g.slots.forEach((s, i) => s && s.color === c && !s.part && (g.slots[i] = null));
+  g.slots.forEach((s, i) => {
+    if (s && s.color === c && !s.part) {
+      if (s.carry) carried.push(s);
+      g.slots[i] = null;
+    }
+  });
   for (const list of [g.belt, g.entering])
     for (let i = list.length - 1; i >= 0; i--)
       if (list[i].color === c) {
+        if (list[i].carry) carried.push(list[i]);
         g.events.push({ type: 'empty', sh: list[i] });
         list.splice(i, 1);
       }
+  // 被收掉的车顶着零件的：零件照样掉下来（铜雀吃掉一色，顺手送你那色的零件）
+  if (g.left > 0) for (const s of carried) dropPart(g, s.carry, -1, s);
 }
 
 function createGame(level, opts) {
@@ -412,6 +436,7 @@ function createGame(level, opts) {
     taps: 0,
     partsOn: !!level.parts,
     partSeed: level.partSeed || 7,
+    recipeN: level.recipeN || 1,
   };
   loadStage(g, 0);
   return g;
@@ -562,7 +587,8 @@ function step(g, dt) {
   }
   for (let i = 0; i < g.belt.length; i++) {
     const s = g.belt[i];
-    s.s += g.speed * dt;
+    // 收尾加速：只剩一成格子时传送带转得快一倍，免得最后几颗等半天
+    s.s += g.speed * (g.left <= g.total * 0.12 ? 2 : 1) * dt;
     if (s.s >= g.L && s.spin) {
       // 转射机转完一圈就散掉，不回槽
       g.belt.splice(i, 1);
@@ -640,6 +666,7 @@ function step(g, dt) {
       g.belt.splice(i, 1);
       i--;
       g.events.push({ type: 'empty', sh: s });
+      if (s.carry && g.left > 0) dropPart(g, s.carry, run[run.length - 1], s);
     }
     if (g.left === 0) {
       g.status = 'win';
@@ -747,6 +774,18 @@ function botParts(g, policy, minFree) {
   for (const i of idx) if (g.slots[i] && g.slots[i].part && !useful(g.slots[i].part)) tapSlot(g, i);
 }
 
+// 机器人用机关：有就用（铜雀挑剩得最多的颜色）；木鸢留到槽只剩一格时再用
+function botTools(g) {
+  if (!g.tools) return;
+  if (g.tools.que > 0) {
+    let best = -1;
+    g.counts.forEach((n, c) => n > 0 && (best < 0 || n > g.counts[best]) && (best = c));
+    if (best >= 0) useTool(g, 'que', best);
+  }
+  if (g.tools.spin > 0) useTool(g, 'spin');
+  if (g.tools.kite > 0 && freeSlots(g) <= 1) useTool(g, 'kite');
+}
+
 function botTap(g, pick) {
   return pick.kind === 'col' ? tapColumn(g, pick.i) : tapSlot(g, pick.i);
 }
@@ -763,6 +802,7 @@ function simulate(level, seed, opt) {
     wait -= dt;
     if (wait <= 0) {
       botParts(g, opt.parts || 'keep', opt.minFree);
+      botTools(g);
       const p = botPick(g, r, noise);
       if (p) {
         botTap(g, p);
@@ -771,6 +811,7 @@ function simulate(level, seed, opt) {
     }
     step(g, dt);
     g.events.length = 0;
+    if (g.status === 'full' && g.tools && g.tools.kite > 0) useTool(g, 'kite');
   }
   return { win: g.status === 'win', time: g.time, left: g.left, total: g.total, taps: g.taps, free: freeSlots(g), hu: g.huCount || 0 };
 }
@@ -956,7 +997,7 @@ function buildLevel(def, seed) {
   const stages = arts.map((a, k) => buildStage(a, def, seed + k * 7777));
   const first = stages[0];
   for (const st of stages) if (st.w !== first.w || st.h !== first.h) throw new Error(def.name + '：一关里几张图要一样大');
-  return { w: first.w, h: first.h, cells: first.cells, cols: first.cols, slots: def.slots || 5, parts: !!def.parts, partSeed: seed, stages: stages.map((st) => ({ cells: st.cells, cols: st.cols })) };
+  return { w: first.w, h: first.h, cells: first.cells, cols: first.cols, slots: def.slots || 5, parts: !!def.parts, partSeed: seed, recipeN: def.recipeN || 1, stages: stages.map((st) => ({ cells: st.cells, cols: st.cols })) };
 }
 
 module.exports = {
@@ -989,6 +1030,8 @@ module.exports = {
   PARTS,
   RECIPES,
   botParts,
+  botTools,
+  useTool,
 };
 
 });
@@ -1984,9 +2027,9 @@ const LEVELS = [
   { name: '工具箱·二', art: pad(ART['工具箱'], 'G', ['B', 'K']), cols: 3, chunks: [10, 20, 30, 40], bury: 0.3, mystery: true, hard: true },
   { name: '汐娘·二', art: pad(ART['汐娘'], 'O', ['R', 'G', 'B']), cols: 4, chunks: [20, 40], hard: true, tune: { head: 0.6, bury: 0.15 } },
 ].map((d, i) => {
-  // 攻防组装：从第 4 关开始（第 4 关先弹「机关图纸」卡片），之前几关只教点连弩车
-  const o = Object.assign({}, BASE, d, i >= 3 ? { parts: true } : {});
-  if (i === 3) o.intro = 'parts';
+  // 攻防组装：从第 7 关开始（原作也是第 7 关出第一个道具；前几关车太少，零件来不及凑），先弹「机关图纸」卡片
+  const o = Object.assign({}, BASE, d, i >= 6 ? { parts: true, recipeN: d.hard ? 3 : i >= 8 ? 2 : 1 } : {});
+  if (i === 6) o.intro = 'parts';
   // 难关、中等关：只有开头一小段按「外层先」排，其余照出关规则把里层颜色往前放
   if (d.hard) Object.assign(o, { head: 0.3, bury: 0.7 });
   else if (d.mid) Object.assign(o, { head: 0.5, bury: 0.3 });
@@ -2099,9 +2142,10 @@ function layout(w, h) {
   const top = Math.max(10, scr.safeTop + 6);
   const barH = 40;
   // 横向一共要放：棋盘 w 格 + 两边各（传送带离棋盘 o 格 + 连弩半径 + 一点边）≈ (w + 3.4) 格 + 26 像素
-  const strip = S.def && S.def.parts ? 44 : 0; // 攻防组装：传送带和槽之间留一条放图纸
-  const cs = Math.max(8, Math.floor(Math.min((W - 34) / (w + 3.4), (H * 0.52 - 26 - strip) / (h + 3.4))));
-  const cartR = Math.max(9, Math.round(cs * 0.85));
+  const strip = S.def && S.def.parts ? 54 : 0; // 攻防组装：传送带和槽之间留一条放图纸 / 机关按钮
+  // 11-21：传送带上的车画大（原来只有指甲盖大，看不出在绕着打）
+  const cs = Math.max(8, Math.floor(Math.min((W - 36) / (w + 4.8), (H * 0.52 - 26 - strip) / (h + 4.8))));
+  const cartR = Math.max(12, Math.round(cs * 1.15));
   const o = (cartR + 9) / cs; // 传送带中线离棋盘几格：连弩不压到铜框
   const bw = cs * w;
   const bh = cs * h;
@@ -2206,6 +2250,7 @@ function startLevel() {
   S.huText = null;
   S.huFlash = null;
   S.birdFly = null;
+  S.aim = null;
   // 照做版：新机制那关先弹一张卡片（原作第 8 关：问号炮台）；难关开局提示一下
   S.card = null;
   S.toast = null;
@@ -2450,11 +2495,9 @@ function onEvent(e) {
         S.ghosts.push({ x0: f.x, y0: f.y, x1: to.x, y1: to.y, t: 0, dur: 0.25, part: core.RECIPES[e.recipe][j] });
       });
       S.huFlash = { k: e.recipe, t: 1 };
-      S.huText = { str: MACHINE_NAME[e.recipe] + '！', sub: e.recipe === 'que' ? '吃掉一整种颜色' : e.recipe === 'spin' ? '转一圈，什么颜色都打' : '多一个槽', t: 0 };
-      S.hitstop = 0.12;
-      S.shake = Math.max(S.shake, 10);
-      S.flash = Math.max(S.flash, 0.6);
-      S.rings.push({ x: to.x, y: to.y, r0: 10, r1: W * 0.6, t: 0, dur: 0.5, color: '#ffe38a', w: 8 });
+      S.huText = { str: MACHINE_NAME[e.recipe] + '做好了', sub: '点下面的按钮放出去', t: 0 };
+      S.shake = Math.max(S.shake, 5);
+      S.rings.push({ x: to.x, y: to.y, r0: 10, r1: 90, t: 0, dur: 0.45, color: '#ffe38a', w: 6 });
       P.sound('merge', 0.9);
       P.vibrate(true);
       break;
@@ -2472,6 +2515,14 @@ function onEvent(e) {
       P.sound('clear', 0.9);
       break;
     }
+    case 'useTool': {
+      S.huText = { str: MACHINE_NAME[e.tool] + '！', sub: e.tool === 'que' ? '吃光一整种颜色' : e.tool === 'spin' ? '转一圈，什么颜色都打' : '多一个槽', t: 0 };
+      S.hitstop = 0.1;
+      S.shake = Math.max(S.shake, 10);
+      S.flash = Math.max(S.flash, 0.5);
+      P.vibrate(true);
+      break;
+    }
     case 'spinIn': {
       const p = beltXY(0);
       S.rings.push({ x: p.x, y: p.y, r0: 10, r1: 60, t: 0, dur: 0.4, color: '#fff1c8', w: 6 });
@@ -2479,6 +2530,15 @@ function onEvent(e) {
       break;
     }
     case 'kiteSlot': {
+      if (e.rescue) {
+        S.huText = { str: '木鸢！', sub: '多一格，接着打', t: 0 };
+        S.endT = 0;
+        S.stats.rounds.pop();
+        S.stats.lastEnd = null;
+        if (S.reward) save.coins -= S.reward.coins;
+        S.reward = null;
+        persist();
+      }
       setTimeout0(() => {
         const p = slotPos(e.at, g.slots.length);
         S.rings.push({ x: p.x, y: p.y, r0: 6, r1: 50, t: 0, dur: 0.45, color: '#c98f55', w: 6 });
@@ -2697,7 +2757,7 @@ function drawCombo() {
   if (S.revealT > 0.3) return; // 插画刷开时让开
   const p = comboPos();
   const n = S.combo;
-  const size = Math.min(64, 22 + n * 0.55) * (1 + 0.25 * S.comboPulse);
+  const size = Math.min(40, 18 + n * 0.3) * (1 + 0.25 * S.comboPulse); // 11-21 缩小：原来一直盖住图的右上角
   const a = Math.min(1, S.comboShow / 0.3);
   ctx.save();
   ctx.globalAlpha = a;
@@ -2842,6 +2902,8 @@ function drawShooter(x, y, r, sh, ang, alpha) {
   // 子弹数
   text(sh.hidden ? '?' : sh.spin ? '✦' + sh.ammo : String(sh.ammo), 0, 1, Math.round(r * (sh.ammo >= 100 ? 0.62 : 0.8)), '#fff', 'center', INK);
   ctx.restore();
+  // 车头顶着的零件：打光弹药才掉进槽里（问号车不露）
+  if (sh.carry && !sh.hidden) drawPart(x + r * 0.72, y - r * 0.72, Math.max(7, r * 0.5), sh.carry, alpha);
 }
 
 function lerp(a, b, t) {
@@ -3004,12 +3066,39 @@ function drawBelt() {
   ctx.stroke();
   // 履带纹：跟着传送带一起走
   ctx.save();
-  ctx.setLineDash([3, L.cs * 1.4]);
-  ctx.lineDashOffset = -S.time * core.CFG.speed * L.cs;
-  ctx.lineWidth = band - 8;
-  ctx.strokeStyle = '#3d3038';
+  ctx.setLineDash([4, L.cs * 1.1]);
+  ctx.lineDashOffset = -S.time * g.speed * L.cs * (g.left <= g.total * 0.12 ? 2 : 1);
+  ctx.lineWidth = band - 6;
+  ctx.strokeStyle = '#5a4650';
   ctx.stroke();
   ctx.restore();
+  // 一圈小箭头跟着转：一眼看出「这是一条在走的传送带」，方向是逆时针（下 → 右 → 上 → 左）
+  {
+    const per = (2 * (bw + bh)) / 14;
+    const off = (S.time * g.speed * L.cs * (g.left <= g.total * 0.12 ? 2 : 1)) % per;
+    for (let k = 0; k < 14; k++) {
+      let d = k * per + off;
+      let px, py, ang;
+      // 沿着圆角矩形的中线走（近似：直边上放箭头，拐角跳过）
+      if (d < bw) { px = x0 + d; py = y0 + bh; ang = 0; }
+      else if ((d -= bw) < bh) { px = x0 + bw; py = y0 + bh - d; ang = -Math.PI / 2; }
+      else if ((d -= bh) < bw) { px = x0 + bw - d; py = y0; ang = Math.PI; }
+      else { d -= bw; px = x0; py = y0 + d; ang = Math.PI / 2; }
+      if ((ang === 0 || ang === Math.PI) && (px < x0 + r0 || px > x0 + bw - r0)) continue;
+      if ((ang !== 0 && ang !== Math.PI) && (py < y0 + r0 || py > y0 + bh - r0)) continue;
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.rotate(ang);
+      ctx.beginPath();
+      ctx.moveTo(4, 0);
+      ctx.lineTo(-3, -4);
+      ctx.lineTo(-3, 4);
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(255,214,140,0.55)';
+      ctx.fill();
+      ctx.restore();
+    }
+  }
   for (const d of [band / 2, -band / 2]) {
     rr(x0 - d, y0 - d, bw + 2 * d, bh + 2 * d, Math.max(2, r0 + d));
     ctx.lineWidth = 3;
@@ -3252,14 +3341,16 @@ function drawMachineIcon(x, y, s, k, lit) {
   ctx.restore();
 }
 
-// 图纸条：每张图纸 = 机关小图 + 三个零件格；槽里已经有的零件亮起来，还差几个一眼看得到
+// 图纸条 / 机关按钮：每张图纸 = 机关小图 + 名字 + 三个零件格；槽里有的零件亮起来。
+// 做好的机关存在这里（×n，金边闪），点它才放；铜雀点了以后再点棋盘上一种颜色。
+const TOOL_TIP = { que: '吃光一色', spin: '什么都打', kite: '多一格' };
 function drawRecipes() {
   const L = S.L;
   const g = S.g;
   if (!g.partsOn || !g.recipes || !g.recipes.length) return;
   const n = g.recipes.length;
-  const cw = Math.min(124, (W - 16) / n - 6);
-  const ch = 38;
+  const cw = Math.min(170, (W - 16) / n - 6);
+  const ch = 48;
   const have = {};
   g.slots.forEach((s) => s && s.part && (have[s.part] = (have[s.part] || 0) + 1));
   S.recipePos = {};
@@ -3271,18 +3362,50 @@ function drawRecipes() {
     const got = want.map((p) => (left[p] > 0 ? (left[p]--, true) : false));
     const nGot = got.filter(Boolean).length;
     const ready = nGot === want.length - 1; // 「听牌」：只差一个
+    const owned = (g.tools && g.tools[k]) || 0;
+    const aiming = S.aim === k;
     const flash = S.huFlash && S.huFlash.k === k ? S.huFlash.t : 0;
-    rr(x0, y0, cw, ch, 10);
-    ctx.fillStyle = flash > 0 ? 'rgba(255,230,160,' + (0.25 + flash) + ')' : ready ? 'rgba(120,70,30,0.85)' : 'rgba(30,20,26,0.85)';
+    const pulse = owned > 0 ? 0.5 + 0.5 * Math.sin(S.time * 6) : 0;
+    rr(x0, y0, cw, ch, 12);
+    ctx.fillStyle = flash > 0 ? 'rgba(255,230,160,' + (0.3 + flash * 0.6) + ')' : owned > 0 ? 'rgba(120,80,20,' + (0.8 + pulse * 0.2) + ')' : ready ? 'rgba(90,55,25,0.9)' : 'rgba(30,20,26,0.88)';
     ctx.fill();
-    ctx.lineWidth = ready ? 2.5 : 1.5;
-    ctx.strokeStyle = ready && Math.floor(S.time * 4) % 2 === 0 ? '#ffd27a' : BRASS_D;
+    ctx.lineWidth = owned > 0 || aiming ? 3 : ready ? 2.5 : 1.5;
+    ctx.strokeStyle = aiming ? '#fff' : owned > 0 ? 'rgba(255,214,120,' + (0.6 + pulse * 0.4) + ')' : ready && Math.floor(S.time * 4) % 2 === 0 ? '#ffd27a' : BRASS_D;
     ctx.stroke();
-    drawMachineIcon(x0 + 18, y0 + ch / 2, 30, k, ready);
-    const pr = Math.min(12, (cw - 40) / 6.4);
-    want.forEach((p, j) => drawPart(x0 + 40 + pr + j * (pr * 2 + 4), y0 + ch / 2, pr, p, 1, !got[j]));
+    drawMachineIcon(x0 + 22, y0 + 19, 30, k, owned > 0);
+    text(MACHINE_NAME[k], x0 + 22, y0 + 40, 10, owned > 0 ? '#ffe7a8' : '#b9a89c');
+    if (owned > 0) {
+      // 做好了：右边不再画零件格，直接写「点我」+ 有几个
+      text(TOOL_TIP[k], x0 + 44 + (cw - 48) / 2, y0 + 17, 13, '#fff3c4', 'center', INK);
+      text(aiming ? '点一种颜色' : '点我放 ×' + owned, x0 + 44 + (cw - 48) / 2, y0 + 35, 12, aiming ? '#fff' : '#ffd27a', 'center', INK);
+      S.buttons.push({ id: 'tool_' + k, x: x0, y: y0, w: cw, h: ch, fn: () => pressTool(k) });
+    } else {
+      const pr = Math.min(14, (cw - 52) / 6.6);
+      want.forEach((p, j) => drawPart(x0 + 46 + pr + j * (pr * 2 + 4), y0 + ch / 2, pr, p, 1, !got[j]));
+    }
     S.recipePos[k] = { x: x0 + cw / 2, y: y0 + ch / 2 };
   });
+  if (S.aim === 'que') {
+    // 瞄准中：棋盘上方一条提示
+    rr(W / 2 - 130, L.by - 6, 260, 30, 15);
+    ctx.fillStyle = 'rgba(20,12,18,0.88)';
+    ctx.fill();
+    text('点棋盘上一种颜色，铜雀把它吃光', W / 2, L.by + 9, 14, '#fff3c4');
+  }
+}
+
+// 按机关按钮：铜雀进入「点颜色」；转射机、木鸢直接放
+function pressTool(k) {
+  const g = S.g;
+  if (k === 'que') {
+    S.aim = S.aim === 'que' ? null : 'que';
+    P.sound('slot', 0.5);
+    return;
+  }
+  if (core.useTool(g, k)) {
+    for (const e of g.events) onEvent(e);
+    g.events.length = 0;
+  }
 }
 
 function drawHuText() {
@@ -3324,8 +3447,9 @@ function drawCard() {
     drawPart(W / 2 - 12, y0 + 132, 20, 'wing');
     text('→', W / 2 + 28, y0 + 133, 26, BRASS_L);
     drawMachineIcon(W / 2 + 84, y0 + 132, 64, 'que', true);
-    text('打掉的零件落进槽里，凑齐一张就合体', W / 2, y0 + 184, 15, '#e8dcc8');
-    text('零件占格子；不要的点一下扔掉', W / 2, y0 + 208, 15, '#e8dcc8');
+    text('车头顶着零件的，打光才掉进槽里', W / 2, y0 + 178, 14, '#e8dcc8');
+    text('凑齐一张图纸，做出机关，点它就放', W / 2, y0 + 200, 14, '#e8dcc8');
+    text('零件占格子，不要的点一下扔掉', W / 2, y0 + 222, 14, '#e8dcc8');
   } else {
     text('问号连弩', W / 2, y0 + 66, 26, '#fff3c4');
     // 一台露脸的 + 两台问号
@@ -3532,6 +3656,16 @@ function drawFailPanel() {
   }
   let by = y0 + 146;
   const bwid = W - 80;
+  if (g.tools && g.tools.kite > 0) {
+    // 手里有木鸢：免费救一格（这就是攒机关的用处）
+    button('kiteRescue', 40, by, bwid, 48, '🪁 放木鸢：多一格，接着打', 'primary', () => {
+      if (core.useTool(g, 'kite')) {
+        for (const e of g.events) onEvent(e);
+        g.events.length = 0;
+      }
+    });
+    by += 60;
+  }
   if (S.adsThisRound < MAX_ADS) {
     button('adSlot', 40, by, bwid, 48, '📺 机关匣加一格，接着打', 'ad', () => showAd(() => {
       S.adsThisRound++;
@@ -3805,6 +3939,26 @@ function onTouch(type, id, x, y) {
   const g = S.g;
   if (!g || g.status !== 'play') return;
   const L = S.L;
+  // 铜雀瞄准中：点棋盘上的一格 → 吃光这种颜色；点别处 = 不放了
+  if (S.aim === 'que') {
+    S.aim = null;
+    const cx = Math.floor((x - L.bx) / L.cs);
+    const cy = Math.floor((y - L.by) / L.cs);
+    if (cx >= 0 && cy >= 0 && cx < g.w && cy < g.h) {
+      // 点到空格也算：找离手指最近的一格有颜色的
+      let best = -1, bd = 1e9;
+      for (let i = 0; i < g.cells.length; i++) {
+        if (g.cells[i] < 0) continue;
+        const d = (i % g.w - cx) ** 2 + (((i / g.w) | 0) - cy) ** 2;
+        if (d < bd) { bd = d; best = i; }
+      }
+      if (best >= 0 && bd <= 4 && core.useTool(g, 'que', g.cells[best])) {
+        for (const e of g.events) onEvent(e);
+        g.events.length = 0;
+      }
+    }
+    return;
+  }
   // 槽位
   const n = g.slots.length;
   for (let i = 0; i < n; i++) {
